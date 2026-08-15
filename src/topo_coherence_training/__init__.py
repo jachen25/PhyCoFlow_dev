@@ -10,10 +10,6 @@ _LAZY_ATTRS = {
     "TopoLossConfig": "topo_loss",
     "soft_rcc_loss": "topo_loss",
     "saliency_stack": "topo_loss",
-    "TopoTrainConfig": "topo_ffm",
-    "combined_training_step": "topo_ffm",
-    "fm_loss_step": "topo_ffm",
-    "clean_estimate": "topo_ffm",
 }
 
 __all__ = list(_LAZY_ATTRS)

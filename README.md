@@ -56,8 +56,23 @@ dataset.
 The SLURM scripts preserve the active cluster environment, including module
 versions and CUDA/KeOps setup. Before using them in another checkout, update
 the account, notification address, dataset paths, and checkpoint paths for
-that environment. Each launcher discovers the repository root from its own
-location; `PROJECT_DIR` can override it when needed.
+that environment.
+
+Submit the topology launcher from the repository root so it can use Slurm's
+`SLURM_SUBMIT_DIR`:
+
+```bash
+sbatch run_pointcloud_ffm_topo_posttrain_active_emulsion.sbatch
+```
+
+When submitting from another directory, export the checkout path explicitly.
+The launcher validates the project root and configuration before loading the
+training environment. `CONFIG` may be absolute or relative to `PROJECT_DIR`.
+
+```bash
+sbatch --export=ALL,PROJECT_DIR=/absolute/path/to/PhyCoFlow_dev \
+  /absolute/path/to/PhyCoFlow_dev/run_pointcloud_ffm_topo_posttrain_active_emulsion.sbatch
+```
 
 Run the self-contained CPU tests from the repository root:
 

@@ -70,7 +70,9 @@ coherence_batch_size: 4
 config_missing_behavior: error
 config_data_grad_scale: 1.0
 config_coherence_grad_scale: 1.0
-epi_rollout_steps: 8                    # Topology rollout NFE; validation gates use NFE=32.
+# When enabled, training and in-training Pareto coherence use 8 NFE.
+# Standalone held-out evaluation defaults to 32 NFE.
+epi_rollout_steps: 8
 topo_prediction_path: rollout
 topo_rollout_full_grid: true
 topo_obs_consistency_mode: default_hard

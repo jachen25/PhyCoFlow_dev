@@ -2342,7 +2342,8 @@ def run_epoch_direct_coherence(model, loader, optimizer, device, args, direct_cf
         if bool(getattr(args, "obs_grid_pool", False)) else None
     rows = []
     every = max(1, int(args.coherence_every_n_steps))
-    constrained = constrained_mode_active(args)
+    topology_enabled = bool(direct_cfg.enabled)
+    constrained = topology_enabled and constrained_mode_active(args)
     if constrained and base_model is None:
         raise RuntimeError(
             "topo_objective_mode='constrained' requires the frozen base model "
@@ -2391,7 +2392,7 @@ def run_epoch_direct_coherence(model, loader, optimizer, device, args, direct_cf
 
         global_step += 1
         coherence_active = (
-            bool(direct_cfg.enabled)
+            topology_enabled
             and topo_loss_fn is not None
             and int(epoch) >= int(args.coherence_start_epoch)
             and (global_step % every == 0)

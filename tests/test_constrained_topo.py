@@ -200,6 +200,62 @@ def test_dual_state_roundtrip():
     print("[ok] dual state checkpoint round-trip")
 
 
+def test_disabled_constrained_arm_uses_data_only_path():
+    class DS(torch.utils.data.Dataset):
+        def __len__(self):
+            return 2
+
+        def __getitem__(self, i):
+            return {'coords': COORDS, 'coords_raw': COORDS, 'fields': mk(i)}
+
+    args = argparse.Namespace(
+        topo_objective_mode='constrained',
+        coherence_every_n_steps=1,
+        coherence_loss_weight=1.0,
+        coherence_weight_warmup_epochs=0,
+        coherence_start_epoch=1,
+        coherence_interval_rescale=False,
+        data_loss_weight=1.0,
+        gradient_clip_norm=1.0,
+        gradient_diagnostics_every_n_steps=0,
+        cond_fields=[0],
+        n_obs_min_list=[4],
+        n_obs_max_list=[4],
+        sensor_layout='independent',
+        obs_grid_stride_list=None,
+        obs_grid_pool=False,
+        n_query_points=64,
+    )
+    loader = torch.utils.data.DataLoader(DS(), batch_size=2)
+
+    enabled_model = FFM()
+    enabled_opt = torch.optim.AdamW(enabled_model.parameters(), lr=1e-4)
+    try:
+        T.run_epoch_direct_coherence(
+            enabled_model, loader, enabled_opt, torch.device('cpu'), args,
+            argparse.Namespace(enabled=True), None, None, 0, 1,
+            base_model=None)
+    except RuntimeError as exc:
+        assert "frozen base" in str(exc)
+    else:
+        raise AssertionError("enabled constrained mode accepted a missing base model")
+
+    control_model = FFM()
+    control_opt = torch.optim.AdamW(control_model.parameters(), lr=1e-4)
+    before = [p.detach().clone() for p in control_model.parameters()]
+    metrics, global_step = T.run_epoch_direct_coherence(
+        control_model, loader, control_opt, torch.device('cpu'), args,
+        argparse.Namespace(enabled=False), None, None, 0, 1,
+        base_model=None)
+
+    assert global_step == 1
+    assert math.isfinite(metrics["data_loss"])
+    assert metrics["coherence_application_fraction"] == 0.0
+    assert any(not torch.equal(old, new.detach())
+               for old, new in zip(before, control_model.parameters()))
+    print("[ok] disabled constrained arm trains data-only without a frozen base")
+
+
 def test_constrained_epoch_integration():
     base = _os.path.join(_os.path.dirname(_SRC_DIR), "Save_config", "active_emulsion")
     config_path = _os.path.join(
@@ -303,5 +359,6 @@ if __name__ == "__main__":
     test_truncated_rollout_gradients()
     test_dual_ascent_behavior()
     test_dual_state_roundtrip()
+    test_disabled_constrained_arm_uses_data_only_path()
     test_constrained_epoch_integration()
     print("ALL CONSTRAINED-TOPO TESTS PASSED")

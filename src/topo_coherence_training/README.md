@@ -63,8 +63,8 @@ The configured path uses:
 - physical residual matching for `w = alpha * curl(v)` and `div(v)` after
   denormalization; and
 - antialiased 128-to-64 topology rasterization and an 8-step Euler training rollout
-  with hard clamping at co-located `vx`/`vy` sensors; held-out validation uses 32
-  rollout steps.
+  with hard clamping at co-located `vx`/`vy` sensors. In-training Pareto coherence
+  also uses `epi_rollout_steps=8`; standalone held-out evaluation defaults to 32 NFE.
 
 Explicit component weights are followed by detached inverse-gradient EMA scaling.
 Projected dual ascent updates the data and frozen-model anchor multipliers from
