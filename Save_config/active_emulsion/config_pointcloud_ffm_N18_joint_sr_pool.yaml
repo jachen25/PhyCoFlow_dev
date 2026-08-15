@@ -1,0 +1,128 @@
+# N18 joint pooled super-resolution baseline.
+#
+# Conditioning uses pooled regular grids:
+#   phi: 8x8 block means, yielding 256 observations on a 16x16 grid.
+#   vx, vy: 16x16 block means, yielding 64 co-located velocity vectors.
+# This matches a dual-channel fluorescence and micro-PIV measurement protocol.
+# Stokes damping concentrates velocity energy at scales resolved by the coarse
+# PIV grid. The model reconstructs full-resolution phi, vx, and vy; vorticity
+# is derived as w = dvx/dy - dvy/dx.
+#
+# Block means are not pointwise constraints, so sampling uses endpoint_smooth
+# without a final hard clamp. The smoothing scale 0.08 lies between the phase
+# cell size (8/127) and velocity cell size (16/127).
+#
+# Translation and 90-degree rotation augmentation preserve both sensor grids.
+
+Demo_Num: 18
+device_ids: [0]
+
+dataset: "active_emulsion"
+ae_data_root: "~/orcd/pool/active_emulsion_dataset/data_half_885"
+ae_protocol: "interp"
+# No w channel: vorticity is derived from the generated velocity, not modeled.
+ae_fields: ["phi", "vx", "vy"]
+data: "Dataset"
+
+save_dir: "Save_TrainedModel/ffm_ae_pointcloud_joint_sr_pool"
+
+seed : 42
+epochs : 10000
+batch_size : 64
+lr : 1.0e-4
+weight_decay : 1.0e-4
+num_workers : 12
+
+initialization: "scratch"
+
+# H, R, and m are calibrated experiment parameters available at inference.
+param_conditioning: true
+param_n_freq: 4
+param_jitter: 0.1
+param_dropout: 0.1
+param_embed_hidden: 128
+
+backbone: "GL_rbf_ENH"
+
+hidden_dim : 256
+cond_dim : 128
+field_embed_dim : 128
+sigma_min : 1.0e-4
+rbf_sigma : 0.05
+
+use_fourier_pe: true
+pe_num_bands: 32
+pe_max_freq: 64.0
+
+latent_dim: 256
+num_latents: 128
+num_heads: 8
+num_latent_blocks: 4
+ff_mult: 4
+attn_dropout: 0.1
+mlp_dropout: 0.1
+decode_chunk_size: 4096
+share_query_proj: false
+
+summary_type: "mean"
+
+gather_mode: "topk_rbf_glres"
+gather_topk: 32
+sensor_local_topk: 16
+gather_query_chunk_size: 2048
+learnable_rbf_sigma: true
+neighbor_backend: "keops"
+sensor_local_dropout: 0.0
+
+sensor_coord_encoding: "fourier"
+latent_sensor_reinject: true
+latent_reinject_every: 1
+query_latent_readout: true
+query_readout_type: "coord"
+query_readout_scale_init: 1.0e-2
+enhanced_head_norm: true
+glres_scale_init: 1.0e-2
+
+Num_x: 128
+Num_y: 128
+fno_modes_x: 24
+fno_modes_y: 24
+fno_hidden_channels: 64
+fno_n_layers: 4
+condition_blur: true
+condition_blur_kernel: 15
+condition_blur_sigma: 2.5
+
+n_query_points : 2048
+prior : "rff"
+rff_features : 256
+rff_lengthscale : 0.15
+
+eval_every : 5
+save_every : 200
+snapshot_every : 10000
+snapshot_keep : 1
+n_steps_generation : 32
+
+# Phi uses stride 8; vx and vy use stride 16 and share block centroids.
+# Strided fields ignore the observation bounds, which remain length-matched.
+cond_fields :   [0, 1, 2]
+n_obs_min_list: [256, 64, 64]
+n_obs_max_list: [256, 64, 64]
+obs_grid_stride_list: [8, 16, 16]
+obs_grid_pool: true
+
+vis_cond_fields: [0, 1, 2]
+vis_n_obs_list: [256, 64, 64]
+vis_obs_grid_stride_list: [8, 16, 16]
+
+ae_flow_transform: "asinh"
+
+ae_frame_downsample: true
+ae_frame_tau: 0.02
+ae_frame_min: 4
+
+ae_augment: "translate_rot90"
+
+ode_solver : "euler"
+benchmark_n_steps : [2, 4, 8]

@@ -1,0 +1,209 @@
+# N14 epoch-matched data-only control for N13.
+
+Demo_Num: 14
+device_ids: [0]
+dataset: active_emulsion
+save_dir: Save_TrainedModel/ffm_ae_pointcloud_dataonlyN14
+RELOAD: false
+
+training_mode: direct_coherence
+initialization: pretrained
+pretrained_run_dir: Save_TrainedModel/ffm_ae_pointcloud_piv_half_DemoN12_20260810_211156
+pretrained_source_Demo_Num: null
+pretrained_checkpoint: frozen_ep3615_posttrain_base  # Immutable source checkpoint.
+pretrained_min_epoch: 3000
+pretrained_load_optimizer: false
+pretrained_strict: true
+pretrained_use_source_base_config: true
+pretrained_allow_stats_mismatch: false
+
+# Dataset identity.
+ae_data_root: ~/orcd/pool/active_emulsion_dataset/data_half_885
+ae_protocol: interp
+ae_fields: [phi, w, vx, vy]
+ae_splits_path: null
+ae_flow_transform: asinh
+ae_frame_downsample: true
+ae_frame_tau: 0.02
+ae_frame_min: 4
+# Training augmentation shared by both comparison arms.
+ae_augment: translate_rot90
+
+# Parameter conditioning.
+param_jitter: 0.1
+param_dropout: 0.1
+param_conditioning: true
+
+seed: 42
+epochs: 80
+batch_size: 32
+lr: 3.0e-5
+weight_decay: 1.0e-4
+num_workers: 4
+train_ratio_downsample: 0.5
+
+# Post-training objective.
+direct_coherence_enabled: false
+gradient_balance_mode: weighted_sum
+data_loss_weight: 1.0
+# Constrained objective:
+#   min L_topo, subject to L_data <= baseline * (1 + pareto_rf_relative_tolerance)
+#                          L_anchor <= anchor_budget_frac * baseline
+# Projected dual ascent uses EMA-smoothed constraint losses. The function-space
+# anchor E||v_theta - v_base||^2 limits drift from the frozen source model.
+# L_topo is normalized by its initial value and adjusted for update cadence.
+topo_objective_mode: constrained
+anchor_budget_frac: 0.05
+dual_lr: 0.01
+dual_max: 1.0e+3
+dual_loss_ema_decay: 0.95
+# DRaFT-1 differentiates only the final rollout step to control gradients.
+topo_rollout_backprop_k: 1
+# Validation RF-loss guard; the anchor constraint is the primary drift control.
+val_rf_guard: true
+val_rf_guard_patience: 1
+gradient_diagnostics_every_n_steps: 0
+gradient_clip_norm: 1.0
+coherence_every_n_steps: 8
+coherence_start_epoch: 1
+coherence_batch_size: 4
+config_missing_behavior: error
+config_data_grad_scale: 1.0
+config_coherence_grad_scale: 1.0
+epi_rollout_steps: 8                    # Topology rollout NFE; validation gates use NFE=32.
+topo_prediction_path: rollout
+topo_rollout_full_grid: true
+topo_obs_consistency_mode: default_hard
+
+# Topology parameters shared with N13 but inactive for this control.
+topo_mode: betti_self_mutual
+topo_target: marginal
+topo_grid_h: 64
+topo_grid_w: 64
+topo_n_points: 16384
+topo_idx_seed: 0
+topo_antialias_downsample: true
+topo_presmooth_sigma: 1.0
+topo_periodic_grid: true
+topo_channels: [0]                     # Phase field.
+topo_homology_dims: [0, 1]
+
+# Self and mutual Betti cells.
+topo_self_h0_weight: 1.0
+topo_self_h1_weight: 1.0
+topo_mutual_h0_weight: 0.5
+topo_mutual_h1_weight: 0.5
+topo_filtration_direction: both
+topo_betti_match_saliency: zscore
+
+# Per-stratum mean self-topology.
+topo_marginal_penalty: both
+topo_marginal_quantiles: [0.3, 0.5, 0.7, 0.85, 0.95]
+topo_marginal_level_mode: physical
+topo_marginal_physical_levels: [-0.4, -0.2, 0.0, 0.2, 0.4]
+physics_w_curl_weight: 0.5
+physics_divergence_weight: 0.5
+physics_w_channel: 1
+physics_vx_channel: 2
+physics_vy_channel: 3
+topo_marginal_ema_decay: 0.9
+topo_marginal_variance_weight: 0.1
+topo_marginal_beta: 12.0
+topo_marginal_kappa: 12.0
+# Stratify by dynamics and mean composition.
+topo_marginal_stratify_key: regime_m
+topo_marginal_reference_path: null     # Computed from the training split at startup.
+marginal_ref_max_snaps: 1024           # Reference-snapshot cap across regime_m strata.
+
+# Mutual anchor settings.
+topo_mutual_anchor_source: observed
+topo_mutual_anchor_channels: [2, 3]    # Reference velocity channels.
+topo_mutual_anchor_provider: vorticity # Magnitude of curl(v).
+topo_mutual_carrier_gauge: interface   # Sign-invariant magnitude of grad(phi).
+topo_mutual_reduction: curve
+topo_mutual_r2_warn: 0.8
+topo_mutual_spatial_weight: 0.5
+topo_output_mutual_h0_weight: 0.5
+topo_output_mutual_h1_weight: 0.5
+topo_output_mutual_spatial_weight: 0.5
+topo_component_balance_enabled: true
+topo_component_balance_ema_decay: 0.9
+topo_component_balance_refresh_steps: 8
+topo_component_balance_min_scale: 0.02
+topo_component_balance_max_scale: 20.0
+topo_component_balance_eps: 1.0e-8
+topo_require_full_cell_coverage: true
+topo_min_mutual_valid_fraction: 0.95
+
+# Mutual slice family.
+topo_bifilt_carrier_channel: 0
+topo_bifilt_second_channel: 1
+topo_bifilt_second_provider: abs_channel
+topo_bifilt_n_lines: 4
+topo_bifilt_theta_min_deg: 15.0
+topo_bifilt_offset_q_lo: 0.05
+topo_bifilt_offset_q_hi: 0.95
+topo_bifilt_axis_map: reference_zscore
+
+# Model architecture inherited from the source checkpoint.
+data: Dataset
+backbone: GL_rbf_ENH
+hidden_dim: 256
+cond_dim: 128
+field_embed_dim: 128
+sigma_min: 1.0e-4
+rbf_sigma: 0.05
+latent_dim: 256
+num_latents: 128
+num_heads: 8
+num_latent_blocks: 4
+ff_mult: 4
+attn_dropout: 0.1
+mlp_dropout: 0.1
+decode_chunk_size: 4096
+share_query_proj: false
+summary_type: mean
+gather_mode: topk_rbf_glres
+gather_topk: 32
+sensor_local_topk: 16
+gather_query_chunk_size: 2048
+learnable_rbf_sigma: true
+neighbor_backend: keops
+sensor_local_dropout: 0.0
+use_fourier_pe: true
+pe_num_bands: 32
+pe_max_freq: 64.0
+sensor_coord_encoding: fourier
+latent_sensor_reinject: true
+latent_reinject_every: 1
+query_latent_readout: true
+query_readout_type: coord
+query_readout_scale_init: 1.0e-2
+enhanced_head_norm: true
+glres_scale_init: 1.0e-2
+Num_x: 128
+Num_y: 128
+n_query_points: 2048
+prior: rff
+rff_features: 256
+rff_lengthscale: 0.15
+cond_fields: [2, 3]
+sensor_layout: colocated
+n_obs_min_list: [128, 128]
+n_obs_max_list: [512, 512]
+vis_cond_fields: [2, 3]
+vis_n_obs_list: [256, 256]
+
+eval_every: 10
+val_coherence: true
+val_coherence_batches: 8
+pareto_selection_enabled: false
+pareto_rf_relative_tolerance: 0.02
+pareto_topology_metric: val_topo_topo_selection_loss
+pareto_rf_baseline: null
+save_every: 10
+snapshot_every: 10                     # Epoch-matched snapshots.
+snapshot_keep: 0
+n_steps_generation: 32
+ode_solver: euler
+benchmark_n_steps: [2, 4, 8]
