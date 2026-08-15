@@ -38,6 +38,7 @@ __all__ = [
     "gather_from_grid",
     "splat_obs_to_grid",
     "build_sparse_condition",
+    "resolve_pooled_value_transform",
     "nearest_fill_grid",
     "MetricsLogger",
     "visualize_reconstruction",
@@ -1605,22 +1606,29 @@ def resolve_pooled_obs_consistency(mode: str, final_clamp: bool,
     single pixel, so scatter-clamping it into its representative node
     (default_hard, endpoint, or the final trusted-sensor clamp) would write
     systematically wrong values wherever blocks straddle interfaces.
-    endpoint_smooth guides sampling with a Gaussian-weighted observation map
-    and needs no per-pixel identity, so it (or 'none') is the compatible
-    mode, matching how the upstream SuperResolution subtask applies
-    observation consistency in its mixed-resolution setting.
+    Raw sampling (``none``) is the safe default because the observations
+    already condition the network through sensor tokens. ``endpoint_smooth``
+    remains available as an explicit opt-in, but its interpolation can imprint
+    the coarse lattice when its bandwidth is too narrow.
     """
     if not obs_grid_pool:
         return mode, final_clamp
     from obs_consistency import normalize_obs_consistency_mode
     eff = normalize_obs_consistency_mode(mode)
     tag = f" [{context}]" if context else ""
-    if eff in ("default_hard", "endpoint"):
+    if eff == "default_hard":
         if ("mode", context) not in _POOLED_NOTICES:
             _POOLED_NOTICES.add(("mode", context))
             print(f"[obs_grid_pool]{tag} obs_consistency_mode={eff!r} would "
-                  "clamp block means into single pixels; using "
-                  "'endpoint_smooth'.")
+                  "clamp block means into single pixels; using raw sampling "
+                  "('none').")
+        eff = "none"
+    elif eff == "endpoint":
+        if ("mode", context) not in _POOLED_NOTICES:
+            _POOLED_NOTICES.add(("mode", context))
+            print(f"[obs_grid_pool]{tag} obs_consistency_mode='endpoint' would "
+                  "treat block means as point values; using the explicitly "
+                  "guided 'endpoint_smooth' mode instead.")
         eff = "endpoint_smooth"
     if final_clamp:
         if ("clamp", context) not in _POOLED_NOTICES:
@@ -1636,6 +1644,25 @@ def resolve_pooled_obs_consistency(mode: str, final_clamp: bool,
 _POOLED_NOTICES: set = set()
 
 
+def resolve_pooled_value_transform(dataset):
+    """Return an opt-in dataset adapter for physical-space block averages.
+
+    Dataset wrappers such as ``Subset`` are unwrapped automatically. Datasets
+    without the explicit two-way transform contract retain historical
+    model-space pooling behavior.
+    """
+    current = dataset
+    seen = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if (bool(getattr(current, "pool_observations_physical", False))
+                and callable(getattr(current, "denormalize", None))
+                and callable(getattr(current, "normalize_field", None))):
+            return current
+        current = getattr(current, "dataset", None)
+    return None
+
+
 def build_sparse_condition(
     coords_full: torch.Tensor,
     fields_full: torch.Tensor,
@@ -1649,6 +1676,7 @@ def build_sparse_condition(
     sensor_layout: str = "independent",
     obs_grid_strides: Optional[Union[int, Sequence[int]]] = None,
     obs_grid_pool: bool = False,
+    pool_value_transform=None,
 ):
     """Build field-tagged scalar observations from a point cloud.
 
@@ -1689,6 +1717,12 @@ def build_sparse_condition(
             call sites. Requires a full regular grid (every (iy, ix) node
             occupied exactly once). Consumes no RNG. Ignored for stride-0
             (random) fields.
+        pool_value_transform: optional dataset adapter exposing
+            ``denormalize(fields_full)`` and
+            ``normalize_field(block_values, field_id)``. When supplied,
+            block means are taken in raw physical space and then transformed
+            back to model space. Random and non-pooled observations are
+            unchanged.
 
     Returns:
         obs_coords:    [B, M, D]
@@ -1747,6 +1781,20 @@ def build_sparse_condition(
 
     bsz, n_pts, coord_dim = coords_full.shape
     device = coords_full.device
+
+    pool_fields_full = fields_full
+    if obs_grid_pool and pool_value_transform is not None:
+        denormalize = getattr(pool_value_transform, "denormalize", None)
+        normalize_field = getattr(pool_value_transform, "normalize_field", None)
+        if not callable(denormalize) or not callable(normalize_field):
+            raise TypeError(
+                "pool_value_transform must expose callable denormalize() and "
+                "normalize_field() methods.")
+        pool_fields_full = denormalize(fields_full)
+        if tuple(pool_fields_full.shape) != tuple(fields_full.shape):
+            raise ValueError(
+                "pool_value_transform.denormalize changed the field shape: "
+                f"{tuple(fields_full.shape)} -> {tuple(pool_fields_full.shape)}.")
 
     grid_aware = coords_2d is not None
     if grid_aware:
@@ -1888,7 +1936,9 @@ def build_sparse_condition(
                         valid_mask[b] if valid_mask is not None else None)
                     pooled_geo_cache[grid_s] = geo
                 vals = _pooled_block_values(
-                    fields_full[b, :, fld], geo, Ny, Nx, grid_s)
+                    pool_fields_full[b, :, fld], geo, Ny, Nx, grid_s)
+                if pool_value_transform is not None:
+                    vals = pool_value_transform.normalize_field(vals, fld)
                 count = int(geo["rep_idx"].numel())
                 end = cursor + count
                 obs_coords[b, cursor:end] = geo["centroids"].to(coords_full.dtype)
@@ -1973,8 +2023,9 @@ def nearest_fill_grid(value_grid: torch.Tensor,
 
 class MetricsLogger:
     def __init__(self, base_dir: str, Demo_Num: int, timestamp: str,
-                 method_name: Optional[str] = None):
-        """Create the run directory and initialize the loss CSV."""
+                 method_name: Optional[str] = None,
+                 resume_through_epoch: Optional[int] = None):
+        """Create the run directory and restore or initialize its loss CSV."""
         self.method_name = method_name or "Model"
         # Create the timestamped loss directory.
         self.save_dir = os.path.join(base_dir, f"Loss_DemoN{Demo_Num}_{timestamp}")
@@ -1983,15 +2034,55 @@ class MetricsLogger:
         self.csv_path = os.path.join(self.save_dir, "losses.csv")
         self.plot_path = os.path.join(self.save_dir, "loss_curve.png")
 
-        # Initialize CSV headers.
-        with open(self.csv_path, mode='w', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow(["epoch", "train_loss", "val_loss"])
-
-        # Store loss history for plotting.
+        # Restore history when a wall-time-limited run is resumed. Reopening
+        # with ``w`` would erase the active curve. Rows beyond the checkpoint
+        # epoch are discarded so a resumed run cannot append a second branch.
         self.epochs = []
         self.train_losses = []
         self.val_losses = []
+        rewrite_history = False
+        if os.path.exists(self.csv_path):
+            loaded = {}
+            with open(self.csv_path, mode='r', newline='') as f:
+                reader = csv.DictReader(f)
+                expected = {"epoch", "train_loss", "val_loss"}
+                if reader.fieldnames is None or not expected.issubset(reader.fieldnames):
+                    raise ValueError(
+                        f"Cannot resume malformed metrics CSV: {self.csv_path}")
+                for row in reader:
+                    if not row.get("epoch") or not row.get("train_loss"):
+                        continue
+                    epoch = int(row["epoch"])
+                    if (resume_through_epoch is not None
+                            and epoch > int(resume_through_epoch)):
+                        rewrite_history = True
+                        continue
+                    val = row.get("val_loss", "")
+                    if epoch in loaded:
+                        rewrite_history = True
+                    loaded[epoch] = (
+                        float(row["train_loss"]),
+                        float(val) if val not in (None, "") else None)
+            for epoch in sorted(loaded):
+                train_loss, val_loss = loaded[epoch]
+                self.epochs.append(epoch)
+                self.train_losses.append(train_loss)
+                self.val_losses.append(val_loss)
+            if rewrite_history:
+                tmp_path = self.csv_path + ".resume_tmp"
+                with open(tmp_path, mode='w', newline='') as f:
+                    writer = csv.writer(f)
+                    writer.writerow(["epoch", "train_loss", "val_loss"])
+                    for epoch, train_loss, val_loss in zip(
+                            self.epochs, self.train_losses, self.val_losses):
+                        writer.writerow([
+                            epoch, train_loss,
+                            val_loss if val_loss is not None else ""])
+                os.replace(tmp_path, self.csv_path)
+        else:
+            with open(self.csv_path, mode='w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(["epoch", "train_loss", "val_loss"])
 
     def log_and_plot(self, epoch: int, train_loss: float, val_loss: float = None):
         """Append epoch losses and update the loss curve."""

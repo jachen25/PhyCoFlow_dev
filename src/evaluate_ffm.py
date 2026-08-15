@@ -16,6 +16,7 @@ import torch.nn.functional as F
 
 from helpers import (
     TurbulentCombustionH5Dataset,
+    ActiveEmulsionDataset,
     NonlinearPoissonDataset,
     ElasticityDataset,
     AirfoilCGridDataset,
@@ -28,6 +29,7 @@ from helpers import (
     save_smooth_mask_plot,
     _safe_json_float_dict,
     build_sparse_condition,
+    resolve_pooled_value_transform,
     resolve_pooled_obs_consistency,
     set_obs_noise,
     _save_single_field_plot,
@@ -71,7 +73,7 @@ def parse_args():
 
     p.add_argument("--checkpoint", type=str, default="best", choices=["best", "last"],
                    help="Which checkpoint to load from the recovered run directory.")
-    p.add_argument("--n-steps-generation", type=int, default = 4,
+    p.add_argument("--n-steps-generation", type=int, default=None,
                    help="Override generation steps. Defaults to YAML n_steps_generation if present.")
     p.add_argument("--device", type=str, default=None, help="e.g. cuda:0 or cpu")
 
@@ -87,7 +89,7 @@ def parse_args():
     p.add_argument("--dataset", type=str, default=None,
                    choices=["turbulent_combustion", "poisson", "elasticity",
                             "airfoil", "airfoil_interp", "airfoil_interp_5f",
-                            "car_cfd"],
+                            "car_cfd", "active_emulsion"],
                    help="Dataset tag. Used to disambiguate Demo_Num "
                         "collisions across datasets when picking the YAML "
                         "config; also overrides cfg['dataset'].")
@@ -183,12 +185,19 @@ def parse_args():
     )
     p.add_argument(
         "--obs-grid-pool",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
         default=None,
         help="Force mean-pooled coarse observations (block means at block "
              "centroids) for strided fields. Default: the training YAML's "
-             "obs_grid_pool. Pooled sampling auto-uses endpoint_smooth "
-             "consistency with no final clamp.",
+             "obs_grid_pool. Pooled sampling defaults to raw conditional "
+             "generation with no final clamp.",
+    )
+    p.add_argument(
+        "--obs-grid-pool-physical",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override whether pooled values are averaged in physical space "
+             "before the dataset's nonlinear normalization.",
     )
 
     return p.parse_args()
@@ -239,6 +248,52 @@ def _find_latest_yaml(cfg_dir: Path, demo_num: int,
     return candidates[-1]
 
 
+def _find_latest_checkpoint_run(
+    demo_root: Path,
+    cfg: dict,
+    demo_num: int,
+    checkpoint: str,
+) -> Path:
+    """Find the latest active checkpoint run independently of YAML time.
+
+    RELOAD submissions resume the original run directory but may archive a new
+    YAML timestamp. Rank eligible runs by ``last.pt`` activity while requiring
+    the requested checkpoint to exist.
+    """
+    save_dir_cfg = Path(
+        cfg.get("save_dir", "Save_TrainedModel/ffm_tc_pointcloud"))
+    prefix = f"{save_dir_cfg.name}_DemoN{int(demo_num)}_"
+    roots = [
+        demo_root / "Save_TrainedModel" / cfg.get(
+            "dataset", "turbulent_combustion"),
+        demo_root / save_dir_cfg.parent,
+    ]
+    candidates = []
+    seen = set()
+    for root in roots:
+        if not root.exists():
+            continue
+        for run_dir in root.glob(prefix + "*"):
+            resolved = run_dir.resolve()
+            if resolved in seen or not run_dir.is_dir():
+                continue
+            seen.add(resolved)
+            requested = run_dir / f"{checkpoint}.pt"
+            if not requested.exists():
+                continue
+            activity = run_dir / "last.pt"
+            if not activity.exists():
+                activity = requested
+            candidates.append((
+                activity.stat().st_mtime_ns, run_dir.name, run_dir))
+    if not candidates:
+        expected = roots[0] / f"{prefix}<timestamp>" / f"{checkpoint}.pt"
+        raise FileNotFoundError(
+            f"No checkpoint-bearing run found for Demo_Num={demo_num}; "
+            f"expected a path like {expected}.")
+    return max(candidates, key=lambda item: (item[0], item[1]))[2]
+
+
 def _normalize_eval_config(cfg: dict) -> dict:
     cfg = dict(cfg)
 
@@ -275,6 +330,11 @@ def _normalize_eval_config(cfg: dict) -> dict:
 
     # Mean-pooled coarse observation (block means instead of node values).
     cfg["obs_grid_pool"] = bool(cfg.get("obs_grid_pool", False))
+    cfg["obs_grid_pool_physical"] = bool(
+        cfg.get("obs_grid_pool_physical", False))
+    if cfg["obs_grid_pool_physical"] and not cfg["obs_grid_pool"]:
+        raise ValueError(
+            "obs_grid_pool_physical=true requires obs_grid_pool=true.")
 
     if cfg.get("backbone") is None:
         cfg["backbone"] = "mlp_rbf"
@@ -295,6 +355,27 @@ def _build_prior(cfg: dict):
 def _build_model(cfg: dict, dataset) -> torch.nn.Module:
     prior = _build_prior(cfg)
     backbone_name = cfg.get("backbone", "mlp_rbf")
+
+    param_kwargs = {}
+    if bool(cfg.get("param_conditioning", False)):
+        names = getattr(dataset, "PARAM_NAMES", None)
+        mu = getattr(dataset, "param_mu", None)
+        sigma = getattr(dataset, "param_sigma", None)
+        log_mask = getattr(dataset, "PARAM_LOG", None)
+        if names is None or mu is None or sigma is None or log_mask is None:
+            raise ValueError(
+                "param_conditioning=true, but the evaluation dataset does not "
+                "expose PARAM_NAMES/PARAM_LOG/param_mu/param_sigma.")
+        param_kwargs = dict(
+            n_params=len(names),
+            param_log_mask=list(log_mask),
+            param_mu=mu.tolist(),
+            param_sigma=sigma.tolist(),
+            param_n_freq=int(cfg.get("param_n_freq", 4)),
+            param_jitter=float(cfg.get("param_jitter", 0.1)),
+            param_dropout=float(cfg.get("param_dropout", 0.1)),
+            param_embed_hidden=int(cfg.get("param_embed_hidden", 128)),
+        )
 
     if backbone_name == "perceiver":
         backbone = ConditionalPointPerceiver(
@@ -367,6 +448,9 @@ def _build_model(cfg: dict, dataset) -> torch.nn.Module:
             gather_topk=cfg.get("gather_topk", 32),
             gather_query_chunk_size=cfg.get("gather_query_chunk_size", None),
             learnable_rbf_sigma=cfg.get("learnable_rbf_sigma", False),
+            fieldwise_rbf_gather=cfg.get("fieldwise_rbf_gather", False),
+            rbf_sigma_per_field=cfg.get("rbf_sigma_per_field", None),
+            periodic_coord_periods=cfg.get("periodic_coord_periods", None),
             adaptive_rbf_sigma=cfg.get("adaptive_rbf_sigma", False),
             adaptive_rbf_scale=cfg.get("adaptive_rbf_scale", 1.0),
             neighbor_backend=cfg.get("neighbor_backend", "torch"),
@@ -386,6 +470,7 @@ def _build_model(cfg: dict, dataset) -> torch.nn.Module:
             query_readout_scale_init=query_readout_scale_init,
             enhanced_head_norm=enhanced_head_norm,
             glres_scale_init=glres_scale_init,
+            **param_kwargs,
         )
         model = PointCloudFFM(backbone, prior, sigma_min=cfg.get("sigma_min", 1e-4))
         return model
@@ -884,7 +969,7 @@ def _save_band_energy_plot(
     plt.close(fig)
 
 def _build_dataset(cfg: dict, split: str, demo_root: Path, stats_path: str):
-    """Dispatch dataset construction across the 5 supported datasets."""
+    """Dispatch dataset construction across supported datasets."""
     dataset_tag = cfg.get("dataset", "turbulent_combustion")
     _default_data = {
         "turbulent_combustion": "Dataset/Merged_CH4COTU1P.h5",
@@ -894,6 +979,7 @@ def _build_dataset(cfg: dict, split: str, demo_root: Path, stats_path: str):
         "airfoil_interp": "Dataset/airfoil",
         "airfoil_interp_5f": "Dataset/airfoil",
         "car_cfd": "Dataset/car_cfd/shapenet_car",
+        "active_emulsion": "Dataset",
     }
     data_path = cfg.get("data") or _default_data[dataset_tag]
     if not os.path.isabs(data_path):
@@ -906,6 +992,18 @@ def _build_dataset(cfg: dict, split: str, demo_root: Path, stats_path: str):
         return TurbulentCombustionH5Dataset(
             data_path, split=split, train_ratio=train_ratio, seed=seed,
             time_stride=cfg.get("time_stride", 1), stats_path=stats_path,
+        )
+    if dataset_tag == "active_emulsion":
+        return ActiveEmulsionDataset(
+            cfg.get("ae_data_root", data_path), split=split,
+            protocol=cfg.get("ae_protocol", "interp"),
+            splits_path=cfg.get("ae_splits_path"),
+            fields=tuple(cfg.get("ae_fields", ("phi",))), seed=seed,
+            stats_path=stats_path,
+            flow_transform=cfg.get("ae_flow_transform", "asinh"),
+            frame_downsample=False, augment="none",
+            pool_observations_physical=bool(
+                cfg.get("obs_grid_pool_physical", False)),
         )
     if dataset_tag == "poisson":
         return NonlinearPoissonDataset(
@@ -1021,6 +1119,7 @@ def _evaluate_ffm_snapshot(
             Ny=grid_ny, Nx=grid_nx,
             obs_grid_strides=obs_grid_strides,
             obs_grid_pool=obs_grid_pool,
+            pool_value_transform=resolve_pooled_value_transform(dataset),
         )
     else:
         # Reuse a fixed sensor draw so obs_consistency modes are compared on
@@ -1040,7 +1139,8 @@ def _evaluate_ffm_snapshot(
         n_steps=n_steps,
         clamp_indices=obs_indices,
     )
-    # Pooled observations are block means: force the clamp-free smooth mode.
+    # Pooled observations are block means: raw conditional sampling is the
+    # default; smooth endpoint guidance remains an explicit opt-in.
     obs_consistency_mode, obs_consistency_final_clamp = resolve_pooled_obs_consistency(
         obs_consistency_mode, obs_consistency_final_clamp, obs_grid_pool,
         context="_evaluate_ffm_snapshot")
@@ -1050,7 +1150,7 @@ def _evaluate_ffm_snapshot(
     if obs_grid_pool and "obs_consistency_mode" not in sig.parameters:
         raise ValueError(
             "obs_grid_pool requires a sampler with obs_consistency_mode "
-            "support (endpoint_smooth); this checkpoint's sampler has none.")
+            "support (raw 'none' by default); this checkpoint's sampler has none.")
     if "ode_solver" in sig.parameters:
         sample_kwargs["ode_solver"] = ode_solver
     # Active-emulsion control parameters (H, R, m) are known at inference and
@@ -1114,6 +1214,13 @@ def _evaluate_ffm_snapshot(
     # and body-overlay paths only need the first two columns.
     coords_full_np = coords_raw[0].cpu().numpy()
     coords_xy = coords_full_np[:, :2]
+    obs_coords_plot = coords_xy[obs_indices_cpu]
+    if obs_grid_pool:
+        model_xy = coords[0, :, :2].detach().cpu()
+        raw_xy = coords_raw[0, :, :2].detach().cpu()
+        if (model_xy.shape == raw_xy.shape
+                and torch.allclose(model_xy, raw_xy, atol=1e-6, rtol=1e-6)):
+            obs_coords_plot = obs_coords[0, valid, :2].detach().cpu().numpy()
 
     triang = None
     body_polygon = None
@@ -1130,7 +1237,7 @@ def _evaluate_ffm_snapshot(
         sensor_coords = None
         m = (obs_field_ids_cpu == c)
         if np.any(m):
-            sensor_coords = coords_xy[obs_indices_cpu[m]]
+            sensor_coords = obs_coords_plot[m]
         if write_field_plots:
             l2 = _save_single_field_plot(
                 true_f=truth_phys[:, c], pred_f=recon_phys[:, c],
@@ -1363,6 +1470,34 @@ def main():
     if args.dataset is not None:
         cfg["dataset"] = args.dataset
     cfg.setdefault("dataset", "turbulent_combustion")
+
+    # A resumed submission may archive a newer YAML while continuing the
+    # original timestamped run. Resolve the active run first, then rebuild from
+    # its effective args.json.
+    try:
+        model_root = _find_latest_checkpoint_run(
+            demo_root, cfg, args.Demo_Num, args.checkpoint)
+    except FileNotFoundError as e:
+        print(f"[Warning: !] {e}")
+        raise SystemExit(1)
+
+    run_args_path = model_root / "args.json"
+    if run_args_path.exists():
+        try:
+            with open(run_args_path, "r") as f:
+                run_cfg = json.load(f)
+            if not isinstance(run_cfg, dict):
+                raise TypeError("top-level JSON value is not an object")
+            run_cfg.pop("yaml_keys_used", None)
+            cfg.update(run_cfg)
+        except Exception as e:
+            print(f"[Warning: !] Could not load {run_args_path}; "
+                  f"falling back to YAML settings ({e}).")
+    if args.dataset is not None:
+        cfg["dataset"] = args.dataset
+    cfg.setdefault("dataset", "turbulent_combustion")
+    if args.obs_grid_pool_physical is not None:
+        cfg["obs_grid_pool_physical"] = bool(args.obs_grid_pool_physical)
     cfg.setdefault("sensor_surface_offset_min", args.sensor_surface_offset_min)
     cfg.setdefault("sensor_surface_offset_max", args.sensor_surface_offset_max)
     # An evaluation override replaces the configured sensor placement.
@@ -1374,32 +1509,24 @@ def main():
                   f"-> eval={cfg['sensor_placement']} (deliberate train/eval shift)")
     cfg = _normalize_eval_config(cfg)
 
-    train_timestamp = _extract_timestamp(yaml_path)
+    train_timestamp = _extract_timestamp(model_root)
     if train_timestamp is None:
-        print(f"[Warning: !] Could not parse timestamp from config filename: {yaml_path.name}")
-        raise SystemExit(1)
-
-    save_dir_cfg = Path(cfg.get("save_dir", "Save_TrainedModel/ffm_tc_pointcloud"))
-    run_name = f"{save_dir_cfg.name}_DemoN{args.Demo_Num}_{train_timestamp}"
-    # Check dataset-scoped storage before the compatible flat layout.
-    nested = demo_root / "Save_TrainedModel" / cfg["dataset"] / run_name
-    flat = demo_root / save_dir_cfg.parent / run_name
-    model_root = nested if nested.exists() else flat
-
-    if not model_root.exists():
-        print(f"[Warning: !] Matching model directory not found: {model_root}")
+        print(f"[Warning: !] Could not parse timestamp from run directory: "
+              f"{model_root.name}")
         raise SystemExit(1)
 
     ckpt_path = model_root / f"{args.checkpoint}.pt"
-    if not ckpt_path.exists():
-        print(f"[Warning: !] Checkpoint not found: {ckpt_path}")
-        raise SystemExit(1)
 
     device = torch.device(args.device if args.device is not None else ("cuda:0" if torch.cuda.is_available() else "cpu"))
 
     stats_path = str(model_root / "dataset_stats.pt")
     dataset = _build_dataset(cfg, split=args.split, demo_root=demo_root,
                              stats_path=stats_path)
+    if (cfg.get("obs_grid_pool_physical", False)
+            and resolve_pooled_value_transform(dataset) is None):
+        raise ValueError(
+            "obs_grid_pool_physical=true, but the evaluation dataset does not "
+            "provide the required physical pooling transform contract.")
     dataset_tag = cfg.get("dataset", "turbulent_combustion")
 
     try:
@@ -1872,10 +1999,14 @@ def main():
             }
         return agg
 
+    summary_obs_mode, summary_final_clamp = resolve_pooled_obs_consistency(
+        args.obs_consistency_mode, final_clamp, obs_grid_pool,
+        context="evaluation_summary")
     summary = {
         "demo_num": int(args.Demo_Num),
         "dataset": dataset_tag,
         "yaml_path": str(yaml_path),
+        "run_args_path": str(run_args_path) if run_args_path.exists() else None,
         "model_root": str(model_root),
         "checkpoint": str(ckpt_path),
         "split": args.split,
@@ -1896,12 +2027,17 @@ def main():
         "ode_solver": ode_solver,
         "benchmark_n_steps": list(benchmark_n_steps) if benchmark_n_steps else None,
         "benchmark_n_obs": list(benchmark_n_obs) if benchmark_n_obs else None,
-        "obs_consistency_mode": args.obs_consistency_mode,
+        "obs_consistency_mode": summary_obs_mode,
+        "obs_consistency_mode_requested": args.obs_consistency_mode,
         "obs_consistency_strength": float(args.obs_consistency_strength),
         "obs_consistency_sigma": float(args.obs_consistency_sigma),
         "obs_consistency_schedule_power": float(args.obs_consistency_schedule_power),
-        "obs_consistency_final_clamp": bool(final_clamp),
+        "obs_consistency_final_clamp": bool(summary_final_clamp),
         "obs_consistency_compare_modes": args.obs_consistency_compare_modes,
+        "obs_grid_pool": bool(obs_grid_pool),
+        "obs_grid_pool_physical": bool(
+            getattr(dataset, "pool_observations_physical", False)),
+        "obs_grid_stride_list": [int(v) for v in vis_obs_grid_strides],
         "metrics": metrics,
         "sweep_metrics": sweep_metrics,
         "extra_metric_names": list(args.extra_metrics),

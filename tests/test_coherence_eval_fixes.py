@@ -226,6 +226,76 @@ def test_val_sensors_are_fixed_masked_colocated_and_rng_neutral():
     assert not model.training
 
 
+def test_val_coherence_forwards_mixed_physical_pool_operator():
+    import helpers_baseline
+
+    axis = torch.linspace(0.0, 1.0, 4)
+    yy, xx = torch.meshgrid(axis, axis, indexing="ij")
+    coords = torch.stack(
+        (xx.reshape(-1), yy.reshape(-1), torch.zeros(16)), dim=-1
+    ).unsqueeze(0)
+    fields = torch.arange(32, dtype=torch.float32).reshape(1, 16, 2)
+    batch = {"coords": coords, "fields": fields, "regime": ["fixture"]}
+
+    class _Dataset:
+        grid_shape = (4, 4)
+        pool_observations_physical = True
+
+        @staticmethod
+        def denormalize(values):
+            return values
+
+        @staticmethod
+        def normalize_field(values, field_id):
+            return values
+
+    class _Loader:
+        dataset = _Dataset()
+
+        def __iter__(self):
+            return iter((batch,))
+
+    captured = {}
+    original = helpers_baseline.build_sparse_condition
+
+    def capture_sparse_condition(**kwargs):
+        captured.update(kwargs)
+        return original(**kwargs)
+
+    helpers_baseline.build_sparse_condition = capture_sparse_condition
+    args = SimpleNamespace(
+        seed=17,
+        cond_fields=[0, 1],
+        n_obs_min_list=[4, 1],
+        n_obs_max_list=[4, 1],
+        sensor_layout="independent",
+        obs_grid_stride_list=[2, 4],
+        obs_grid_pool=True,
+        obs_grid_pool_physical=True,
+        coherence_batch_size=1,
+        epi_rollout_steps=1,
+        ode_solver="euler",
+        topo_marginal_stratify_key="regime",
+        topo_target="paired",
+        topo_rollout_full_grid=True,
+        topo_obs_consistency_mode="none",
+    )
+    model = _FFM()
+    try:
+        ce.val_coherence(
+            model, _Loader(), _TopoLoss(), torch.arange(16), "cpu", args,
+            max_batches=1)
+    finally:
+        helpers_baseline.build_sparse_condition = original
+
+    assert (captured["Ny"], captured["Nx"]) == (4, 4)
+    assert captured["obs_grid_strides"] == [2, 4]
+    assert captured["obs_grid_pool"] is True
+    assert captured["pool_value_transform"] is _Loader.dataset
+    field_ids = model.model.seen[-1][1][0]
+    assert torch.equal(field_ids, torch.tensor([0, 0, 0, 0, 1]))
+
+
 def test_deployed_gate_forwards_sensor_layout():
     import helpers
 
@@ -233,7 +303,10 @@ def test_deployed_gate_forwards_sensor_layout():
     original = helpers.visualize_reconstruction
 
     def fake_visualize_reconstruction(**kwargs):
-        seen.append(kwargs.get("sensor_layout"))
+        seen.append({
+            key: kwargs.get(key)
+            for key in ("sensor_layout", "obs_grid_strides", "obs_grid_pool")
+        })
         field = np.ones((16, 1), dtype=np.float32)
         return {}, {"truth_phys": field, "recon_phys": field.copy()}
 
@@ -250,6 +323,8 @@ def test_deployed_gate_forwards_sensor_layout():
         vis_cond_fields=[0, 1],
         vis_n_obs_list=[2, 2],
         sensor_layout="colocated",
+        vis_obs_grid_stride_list=[2, 4],
+        obs_grid_pool=True,
         ode_solver="euler",
         topo_marginal_physical_levels=[-0.25, 0.25],
         topo_filtration_direction="both",
@@ -263,7 +338,11 @@ def test_deployed_gate_forwards_sensor_layout():
         )
     finally:
         helpers.visualize_reconstruction = original
-    assert seen == ["colocated"]
+    assert seen == [{
+        "sensor_layout": "colocated",
+        "obs_grid_strides": [2, 4],
+        "obs_grid_pool": True,
+    }]
     gate = result["model"]["h0_curve"]
     assert gate["levels"] == [-0.25, 0.25]
     assert gate["filtration_direction"] == "both"
@@ -368,7 +447,8 @@ def _evaluation_args(**overrides):
     values = dict(
         ae_data_root="/tmp/ae", ae_protocol="interp", ae_fields=["phi", "w", "vx", "vy"],
         ae_flow_transform="asinh", seed=42, vis_cond_fields=[2, 3],
-        vis_n_obs_list=[256, 256], sensor_layout="colocated", ode_solver="euler",
+        vis_n_obs_list=[256, 256], vis_obs_grid_stride_list=[8, 16, 16],
+        sensor_layout="colocated", ode_solver="euler",
         topo_marginal_physical_levels=[-0.4, 0.0, 0.4],
         topo_filtration_direction="both", topo_presmooth_sigma=1.0,
     )
@@ -394,6 +474,17 @@ def test_final_gate_rejects_protocol_and_checkpoint_mismatches():
         raise AssertionError("sensor-layout mismatch was accepted")
     gate.validate_evaluation_protocols(
         [("control", control), ("treatment", treatment)], sensor_layout="colocated")
+
+    treatment.vis_obs_grid_stride_list = [4, 8, 8]
+    try:
+        gate.validate_evaluation_protocols(
+            [("control", control), ("treatment", treatment)],
+            sensor_layout="colocated")
+    except ValueError as exc:
+        assert "vis_obs_grid_stride_list" in str(exc)
+    else:
+        raise AssertionError("visualization stride mismatch was accepted")
+    treatment.vis_obs_grid_stride_list = list(control.vis_obs_grid_stride_list)
 
     matched = {
         "epoch": 20, "source_epoch": 10000,
@@ -595,6 +686,7 @@ if __name__ == "__main__":
     test_gate_h0_curve_matches_fixed_levels_and_keeps_singletons()
     test_gate_h0_curve_matches_training_forward_operator()
     test_val_sensors_are_fixed_masked_colocated_and_rng_neutral()
+    test_val_coherence_forwards_mixed_physical_pool_operator()
     test_deployed_gate_forwards_sensor_layout()
     test_gate_bootstrap_uses_cell_clusters()
     test_deployed_physics_is_clustered_and_paired_between_arms()
@@ -606,4 +698,4 @@ if __name__ == "__main__":
     test_metric_resampling_matches_area_pool_and_rejects_bad_shapes()
     test_generated_output_mutual_gate_detects_velocity_and_phi_errors()
     test_final_gate_resolves_pareto_epoch_for_every_arm()
-    print("16 passed")
+    print("17 passed")

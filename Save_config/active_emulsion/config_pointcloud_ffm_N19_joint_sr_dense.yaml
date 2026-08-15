@@ -1,0 +1,166 @@
+# Historical filename keeps ``_dense`` so existing launch commands still work;
+# the protocol below uses heterogeneous per-field resolution, not dense velocity.
+# N19 field-wise mixed-observation-resolution joint SR. Phi retains the
+# higher-fidelity stride-8 camera signal while velocity retains the
+# lower-fidelity stride-16 PIV signal. Unlike N18, local conditioning is
+# field-aware:
+#
+#   * nearest neighbors are selected independently inside phi, vx, and vy;
+#   * each field has a bandwidth equal to its normalized-coordinate sensor pitch;
+#   * each field's RBF weights normalize to unit mass before a balanced fusion;
+#   * the learned per-sensor gather bias is bypassed so it cannot collapse the
+#     fixed Gaussian interpolation back onto individual coarse PIV cells.
+#
+# Dense phi sensors therefore cannot crowd coarse velocity sensors out of the
+# top-k set or steal their softmax mass. Fixed normalized-coordinate
+# bandwidths also cannot collapse during training:
+#     phi   sigma = 8/127  ~= 0.063, pitch = 0.063
+#     vx/vy sigma = 16/127 ~= 0.126, pitch = 0.126
+# Adjacent kernels overlap by exp(-1/2), producing a smoothly varying local
+# interpolation at both resolutions while preserving the information budget.
+#
+# Conditioning (384 pooled observations total):
+#   phi    : 8x8 block means  -> 16x16 = 256 observations
+#   vx, vy : 16x16 block means -> 8x8 = 64 observations per component
+# The model generates full-resolution phi, vx, vy; vorticity is derived as
+# w = dvx/dy - dvy/dx (w_from_v panel).
+#
+# Pooled observations condition the network as sensor tokens but are not valid
+# pointwise targets. All reconstruction panels use raw conditional sampling
+# ('none'), with no endpoint Gaussian map or final pixel clamp to re-imprint
+# either observation lattice.
+#
+# translate/rot90 augmentation moves the field under the fixed sensor grid.
+# Ladder: N16 decimated phi-only / N17 pooled phi-only / N18 joint sparse-PIV
+# / N19 joint mixed-resolution fieldwise gather.
+
+Demo_Num: 19
+device_ids: [0]
+
+dataset: "active_emulsion"
+ae_data_root: "~/orcd/pool/active_emulsion_dataset/data_half_885"
+ae_protocol: "interp"
+# No w channel: vorticity is derived from the generated velocity, not modeled.
+ae_fields: ["phi", "vx", "vy"]
+data: "Dataset"
+
+save_dir: "Save_TrainedModel/ffm_ae_pointcloud_joint_sr_pool_fieldwise"
+
+seed : 42
+epochs : 10000
+batch_size : 64
+lr : 1.0e-4
+weight_decay : 1.0e-4
+num_workers : 12
+
+initialization: "scratch"
+# The first launch starts from scratch because this save_dir is unique; later
+# submissions of the same sbatch resume its latest checkpoint. A 10k run
+# exceeds the cluster's 48-hour allocation.
+RELOAD: true
+
+# Generating parameters (H, R, m) are experiment control knobs, known at
+# inference (material constants from calibration); same recipe as N15-N17.
+param_conditioning: true
+param_n_freq: 4
+param_jitter: 0.1
+param_dropout: 0.1
+param_embed_hidden: 128
+
+backbone: "GL_rbf_ENH"
+
+hidden_dim : 256
+cond_dim : 128
+field_embed_dim : 128
+sigma_min : 1.0e-4
+# Base phi bandwidth. Per-field values below preserve the exact 1:2 pitch ratio.
+rbf_sigma : 0.06299212598425197
+
+use_fourier_pe: true
+pe_num_bands: 32
+pe_max_freq: 64.0
+
+latent_dim: 256
+num_latents: 128
+num_heads: 8
+num_latent_blocks: 4
+ff_mult: 4
+attn_dropout: 0.1
+mlp_dropout: 0.1
+decode_chunk_size: 4096
+share_query_proj: false
+
+summary_type: "mean"
+
+gather_mode: "topk_rbf_glres"
+gather_topk: 32
+sensor_local_topk: 16
+gather_query_chunk_size: 2048
+fieldwise_rbf_gather: true
+rbf_sigma_per_field: [0.06299212598425197, 0.12598425196850394, 0.12598425196850394]
+# The 128 periodic sites are represented as i/127, so their model-coordinate
+# period is 128/127. RBF/KNN distances use the exact minimum image in x/y;
+# the padded third coordinate is non-periodic.
+periodic_coord_periods: [1.0078740157480315, 1.0078740157480315, 0.0]
+learnable_rbf_sigma: false
+adaptive_rbf_sigma: false
+neighbor_backend: "keops"
+sensor_local_dropout: 0.0
+
+sensor_coord_encoding: "fourier"
+latent_sensor_reinject: true
+latent_reinject_every: 1
+query_latent_readout: true
+query_readout_type: "coord"
+query_readout_scale_init: 1.0e-2
+enhanced_head_norm: true
+glres_scale_init: 1.0e-2
+
+Num_x: 128
+Num_y: 128
+fno_modes_x: 24
+fno_modes_y: 24
+fno_hidden_channels: 64
+fno_n_layers: 4
+condition_blur: true
+condition_blur_kernel: 15
+condition_blur_sigma: 2.5
+
+n_query_points : 2048
+prior : "rff"
+rff_features : 256
+rff_lengthscale : 0.15
+
+eval_every : 5
+save_every : 200
+snapshot_every : 1000
+snapshot_keep : 2
+n_steps_generation : 32
+
+# phi (0) is higher fidelity; vx (1) and vy (2) share the coarser, colocated
+# PIV lattice. Bounds are ignored for strided fields but document the counts.
+cond_fields :   [0, 1, 2]
+n_obs_min_list: [256, 64, 64]
+n_obs_max_list: [256, 64, 64]
+obs_grid_stride_list: [8, 16, 16]
+obs_grid_pool: true
+# Average vx/vy in raw physical units first, then apply the asinh/statistical
+# transform to each block mean. This raw-space arithmetic mean is an idealized
+# coarse PIV-window proxy (not a full correlation-PIV measurement model).
+obs_grid_pool_physical: true
+
+vis_cond_fields: [0, 1, 2]
+vis_n_obs_list: [256, 64, 64]
+vis_obs_grid_stride_list: [8, 16, 16]
+vis_obs_consistency_mode: "none"
+
+ae_flow_transform: "asinh"
+
+ae_frame_downsample: true
+ae_frame_tau: 0.02
+ae_frame_min: 4
+
+ae_augment: "translate_rot90"
+
+ode_solver : "euler"
+benchmark_n_steps : [2, 4, 8]

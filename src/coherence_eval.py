@@ -598,8 +598,40 @@ def val_coherence(model, loader, topo_loss_fn, topo_idx_t, device, args,
     """Evaluate the training topology objective on a bounded validation subset."""
     import random
     from direct_coherence_loss import clean_estimate, clean_estimate_rollout
-    from helpers_baseline import build_sparse_condition
+    from helpers_baseline import (
+        build_sparse_condition,
+        resolve_pooled_value_transform,
+    )
     from topo_modes import needs_rollout
+
+    obs_grid_strides = getattr(args, "obs_grid_stride_list", None)
+    obs_grid_pool = bool(getattr(args, "obs_grid_pool", False))
+    loader_dataset = getattr(loader, "dataset", None)
+    grid_ny = grid_nx = None
+    if obs_grid_strides is not None and any(
+            int(stride) > 1 for stride in obs_grid_strides):
+        base_dataset = loader_dataset
+        seen_datasets = set()
+        while (base_dataset is not None
+               and id(base_dataset) not in seen_datasets
+               and getattr(base_dataset, "grid_shape", None) is None):
+            seen_datasets.add(id(base_dataset))
+            base_dataset = getattr(base_dataset, "dataset", None)
+        grid_shape = getattr(base_dataset, "grid_shape", None)
+        if grid_shape is None:
+            raise ValueError(
+                "held-out coherence validation uses obs_grid_stride_list but "
+                "its loader dataset exposes no regular grid_shape.")
+        grid_ny, grid_nx = int(grid_shape[0]), int(grid_shape[1])
+    pool_value_transform = (
+        resolve_pooled_value_transform(loader_dataset)
+        if obs_grid_pool else None)
+    if (obs_grid_pool
+            and bool(getattr(args, "obs_grid_pool_physical", False))
+            and pool_value_transform is None):
+        raise ValueError(
+            "held-out coherence validation requested physical-space pooling, "
+            "but its loader dataset does not expose the required transform.")
 
     cpu_rng = torch.get_rng_state()
     cuda_rng = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
@@ -631,7 +663,11 @@ def val_coherence(model, loader, topo_loss_fn, topo_idx_t, device, args,
                 coords_full=coords_full, fields_full=fields_full,
                 cond_fields=args.cond_fields, n_obs_min=args.n_obs_min_list,
                 n_obs_max=args.n_obs_max_list, valid_mask=valid_mask,
-                sensor_layout=getattr(args, "sensor_layout", "independent"))
+                sensor_layout=getattr(args, "sensor_layout", "independent"),
+                Ny=grid_ny, Nx=grid_nx,
+                obs_grid_strides=obs_grid_strides,
+                obs_grid_pool=obs_grid_pool,
+                pool_value_transform=pool_value_transform)
         cbsz = min(int(getattr(args, "coherence_batch_size", 2)), coords_full.shape[0])
         sel = torch.arange(cbsz, device=device)
         prediction_path = str(getattr(args, "topo_prediction_path", "auto"))
@@ -745,6 +781,10 @@ def evaluate_coherence_split(models: Dict[str, object], dataset, indices: Sequen
                     n_obs=args.vis_n_obs_list, n_steps=int(n_steps),
                     ode_solver=getattr(args, "ode_solver", None),
                     sensor_layout=getattr(args, "sensor_layout", "independent"),
+                    obs_grid_strides=getattr(
+                        args, "vis_obs_grid_stride_list",
+                        getattr(args, "obs_grid_stride_list", None)),
+                    obs_grid_pool=bool(getattr(args, "obs_grid_pool", False)),
                     snapshot_index=int(idx), file_tag=f"coh_{tag}_i{idx}_d{d}",
                     save_metrics_json=False, return_payload=True)
                 truth_phys = np.asarray(payload["truth_phys"])

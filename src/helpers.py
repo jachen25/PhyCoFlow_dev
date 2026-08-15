@@ -26,6 +26,7 @@ from helpers_baseline import (
     CarCFDDataset,
     _build_structured_triangulation,
     build_sparse_condition,
+    resolve_pooled_value_transform,
     resolve_pooled_obs_consistency,
     set_obs_noise,
     collate_snapshots,
@@ -215,7 +216,7 @@ class ActiveEmulsionDataset(Dataset):
                  fields=("phi",), seed=42, stats_path=None,
                  flow_transform="asinh",
                  frame_downsample=False, frame_tau=0.02, frame_min=4,
-                 augment="none"):
+                 augment="none", pool_observations_physical=False):
         """Configure field transforms, train-only thinning, and torus augmentation.
 
         ``asinh`` compresses flow channels and is exactly inverted by
@@ -229,6 +230,10 @@ class ActiveEmulsionDataset(Dataset):
             if fn not in self.ALL_FIELDS:
                 raise ValueError(f"unknown field {fn!r}; choose from {self.ALL_FIELDS}")
         self.num_fields = len(self.field_names)
+        # Opt-in keeps older pooled runs bit-compatible. When enabled, sparse
+        # block observations are averaged in raw physical units and only then
+        # normalized (required for literal PIV means under nonlinear asinh).
+        self.pool_observations_physical = bool(pool_observations_physical)
         # Temporal thinning is intended for the train split only.
         self.frame_downsample = bool(frame_downsample)
         self.frame_tau = float(frame_tau)
@@ -467,6 +472,21 @@ class ActiveEmulsionDataset(Dataset):
         lin = self.lin_mask.to(x.device)
         u = torch.where(lin, x, torch.asinh(x / sc))
         return (u - m) / s
+
+    def normalize_field(self, x, field_id: int):
+        """Map raw values from one channel into the model representation."""
+        if not torch.is_tensor(x):
+            x = torch.as_tensor(x)
+        field_id = int(field_id)
+        if field_id < 0 or field_id >= self.num_fields:
+            raise IndexError(
+                f"field_id={field_id} outside [0, {self.num_fields}).")
+        mean = self.mean[field_id].to(x.device, x.dtype)
+        std = self.std[field_id].to(x.device, x.dtype)
+        scale = self.asinh_scale[field_id].to(x.device, x.dtype)
+        transformed = (x if bool(self.lin_mask[field_id])
+                       else torch.asinh(x / scale))
+        return (transformed - mean) / std
 
     def denormalize(self, z):
         """normalized fields (..., C) -> raw physical (inverts normalize)."""
@@ -826,6 +846,7 @@ def reconstruct_snapshot(
         Nx=grid_nx,
         obs_grid_strides=obs_grid_strides,
         obs_grid_pool=obs_grid_pool,
+        pool_value_transform=resolve_pooled_value_transform(dataset),
     )
 
     # Pass only controls supported by the sampler signature.
@@ -839,13 +860,13 @@ def reconstruct_snapshot(
         clamp_indices=obs_indices,
     )
 
-    # Block means require smooth endpoint conditioning rather than a
-    # pointwise clamp at the representative node.
+    # Pooled observations are block means: use raw conditional sampling by
+    # default and never write those means into representative pixels.
     if obs_grid_pool:
         if "obs_consistency_mode" not in sig.parameters:
             raise ValueError(
                 "obs_grid_pool requires a sampler with obs_consistency_mode "
-                "support (endpoint_smooth); this checkpoint's sampler has "
+                "support (raw 'none' by default); this checkpoint's sampler has "
                 "none.")
         eff_mode, eff_final = resolve_pooled_obs_consistency(
             "default_hard", True, True, context="reconstruct_snapshot")
@@ -950,6 +971,7 @@ def visualize_reconstruction(
             Nx=grid_nx,
             obs_grid_strides=obs_grid_strides,
             obs_grid_pool=obs_grid_pool,
+            pool_value_transform=resolve_pooled_value_transform(dataset),
         )
     else:
         # Reuse sensors when comparing consistency modes.
@@ -981,8 +1003,8 @@ def visualize_reconstruction(
         effective_obs_mode = "none"
 
     # Pooled observations are block means: clamping them into single pixels
-    # (per-step or final) would inject wrong values, so force the smooth
-    # endpoint guidance instead.
+    # would inject wrong values. Raw conditional sampling is the default;
+    # smooth endpoint guidance remains an explicit opt-in.
     effective_obs_mode, obs_consistency_final_clamp = resolve_pooled_obs_consistency(
         effective_obs_mode, obs_consistency_final_clamp, obs_grid_pool,
         context="visualize_reconstruction")
@@ -1001,7 +1023,7 @@ def visualize_reconstruction(
     if obs_grid_pool and "obs_consistency_mode" not in sig.parameters:
         raise ValueError(
             "obs_grid_pool requires a sampler with obs_consistency_mode "
-            "support (endpoint_smooth); this checkpoint's sampler has none.")
+            "support (raw 'none' by default); this checkpoint's sampler has none.")
     if "obs_consistency_mode" in sig.parameters:
         sample_kwargs.update(
             obs_consistency_mode=effective_obs_mode,
@@ -1035,8 +1057,17 @@ def visualize_reconstruction(
     valid = obs_mask[0].bool()
     obs_indices_cpu = obs_indices[0, valid].cpu().numpy()
     obs_field_ids_cpu = obs_field_ids[0, valid].cpu().numpy()
-    # Gather sensor coordinates on CPU for either plotting mesh.
+    # Pooled observations live at block centroids, not at obs_indices'
+    # representative pixels. Draw their true centroids whenever model and
+    # plotting coordinates share the same x/y frame.
     obs_coords_raw = coords_raw[0, obs_indices[0].cpu()].numpy()[valid.cpu().numpy()]
+    pooled_centroids_raw = None
+    if obs_grid_pool:
+        model_xy = coords[0, :, :2].detach().cpu()
+        raw_xy = coords_raw[0, :, :2].detach().cpu()
+        if (model_xy.shape == raw_xy.shape
+                and torch.allclose(model_xy, raw_xy, atol=1e-6, rtol=1e-6)):
+            pooled_centroids_raw = obs_coords[0, valid, :2].detach().cpu().numpy()
 
     coords_np = plot_coords_raw[0].cpu().numpy()
     coords_xy = coords_np[:, :2]
@@ -1066,7 +1097,9 @@ def visualize_reconstruction(
         sensor_coords = None
         field_sensor_mask = (obs_field_ids_cpu == c)
         if np.any(field_sensor_mask):
-            if use_full_mesh:
+            if pooled_centroids_raw is not None:
+                sensor_coords = pooled_centroids_raw[field_sensor_mask]
+            elif use_full_mesh:
                 sensor_coords = obs_coords_raw[field_sensor_mask]
                 if not is_3d_surface:
                     sensor_coords = sensor_coords[:, :2]
@@ -1170,6 +1203,13 @@ def visualize_reconstruction(
             "n_steps": int(n_steps),
             "ode_solver": ode_solver,
             "obs_consistency_mode": effective_obs_mode,
+            "obs_consistency_mode_requested": obs_consistency_mode,
+            "obs_grid_stride_list": (
+                [int(v) for v in _to_int_list(obs_grid_strides)]
+                if obs_grid_strides is not None else None),
+            "obs_grid_pool": bool(obs_grid_pool),
+            "obs_grid_pool_physical": bool(getattr(
+                dataset, "pool_observations_physical", False)),
             "metrics": metrics,
         }
         with open(metrics_path, "w") as f:

@@ -658,6 +658,9 @@ class ConditionalPointHybridLocalGlobalRBF(nn.Module):
         gather_topk: int = 32,
         gather_query_chunk_size: Optional[int] = None,
         learnable_rbf_sigma: bool = False,
+        fieldwise_rbf_gather: bool = False,
+        rbf_sigma_per_field: Optional[Sequence[float]] = None,
+        periodic_coord_periods: Optional[Sequence[float]] = None,
         adaptive_rbf_sigma: bool = False,
         adaptive_rbf_scale: float = 1.0,
         neighbor_backend: str = "torch",      # ["auto", "torch", "keops"]
@@ -724,9 +727,78 @@ class ConditionalPointHybridLocalGlobalRBF(nn.Module):
         self.gather_topk = int(gather_topk)
         self.gather_query_chunk_size = gather_query_chunk_size
         self.learnable_rbf_sigma = learnable_rbf_sigma
+        self.fieldwise_rbf_gather = bool(fieldwise_rbf_gather)
         self.adaptive_rbf_sigma = bool(adaptive_rbf_sigma)
         self.adaptive_rbf_scale = float(adaptive_rbf_scale)
         self.neighbor_backend = neighbor_backend
+
+        if periodic_coord_periods is None:
+            periodic_coord_periods = [0.0] * int(coord_dim)
+        periodic_coord_periods = [float(v) for v in periodic_coord_periods]
+        if len(periodic_coord_periods) != int(coord_dim):
+            raise ValueError(
+                "periodic_coord_periods must have one entry per coordinate "
+                f"dimension ({coord_dim}); use 0 for non-periodic dimensions, "
+                f"got {periodic_coord_periods}.")
+        if any(not math.isfinite(v) or v < 0.0
+               for v in periodic_coord_periods):
+            raise ValueError(
+                "periodic_coord_periods entries must be finite and non-negative, "
+                f"got {periodic_coord_periods}.")
+        # Python metadata (rather than a persistent buffer) preserves strict
+        # compatibility with existing checkpoints. Positive entries use the
+        # exact minimum-image distance on that periodic axis; zero entries
+        # retain ordinary Euclidean distance.
+        self.periodic_coord_periods = tuple(periodic_coord_periods)
+
+        if self.fieldwise_rbf_gather and self.adaptive_rbf_sigma:
+            raise ValueError(
+                "fieldwise_rbf_gather and adaptive_rbf_sigma are mutually "
+                "exclusive: fieldwise gathering already supplies a normalized-coordinate "
+                "bandwidth for each sensor lattice."
+            )
+        if self.fieldwise_rbf_gather and gather_mode in {
+                "topk_rbf_gate", "topk_rbf_ptlocal"}:
+            raise ValueError(
+                "fieldwise_rbf_gather supports rbf, topk_rbf, and "
+                "topk_rbf_glres. The gate/ptlocal modes add learned or "
+                "field-blind neighbor reweighting that defeats the guaranteed "
+                "per-field geometric interpolation."
+            )
+
+        if rbf_sigma_per_field is not None:
+            rbf_sigma_per_field = [float(v) for v in rbf_sigma_per_field]
+            if not self.fieldwise_rbf_gather:
+                raise ValueError(
+                    "rbf_sigma_per_field requires fieldwise_rbf_gather=true."
+                )
+            if len(rbf_sigma_per_field) != int(n_fields):
+                raise ValueError(
+                    "rbf_sigma_per_field must have one positive value per "
+                    f"model field ({n_fields}), got {rbf_sigma_per_field}."
+                )
+            if any(not math.isfinite(v) or v <= 0.0
+                   for v in rbf_sigma_per_field):
+                raise ValueError(
+                    "rbf_sigma_per_field values must all be finite and positive, got "
+                    f"{rbf_sigma_per_field}."
+                )
+        elif self.fieldwise_rbf_gather:
+            rbf_sigma_per_field = [float(rbf_sigma)] * int(n_fields)
+
+        if self.fieldwise_rbf_gather:
+            if not math.isfinite(float(rbf_sigma)) or float(rbf_sigma) <= 0.0:
+                raise ValueError(
+                    f"rbf_sigma must be finite and positive, got {rbf_sigma}.")
+            # Store only dimensionless coordinate-scale ratios and keep them out
+            # of state_dict. This lets legacy scalar-sigma checkpoints strict-
+            # load into the opt-in fieldwise gather for controlled ablations.
+            self.register_buffer(
+                "_fieldwise_rbf_scale",
+                torch.tensor(rbf_sigma_per_field, dtype=torch.float32)
+                / float(rbf_sigma),
+                persistent=False,
+            )
 
         if self.gather_mode == "rbf": print(f"\nThe gather mode is {gather_mode} as default choice.\n")
         else: print(f"\nNOTICE: The gather mode is {gather_mode} with top-k {gather_topk} !!!\n")
@@ -874,6 +946,14 @@ class ConditionalPointHybridLocalGlobalRBF(nn.Module):
                 nn.Linear(cond_dim, 1),
             )
             self.sensor_importance_scale = nn.Parameter(torch.tensor(float(glres_scale_init)))
+            if self.fieldwise_rbf_gather:
+                # Fieldwise local weights are intentionally pure RBF geometry.
+                # Keep these tensors in state_dict for strict checkpoint
+                # compatibility, but mark the dead branch non-trainable (also
+                # safe for DDP with find_unused_parameters=False).
+                self.sensor_importance_scale.requires_grad_(False)
+                for parameter in self.sensor_importance.parameters():
+                    parameter.requires_grad_(False)
 
         # Latent global processor
         self.latents = nn.Parameter(
@@ -989,7 +1069,8 @@ class ConditionalPointHybridLocalGlobalRBF(nn.Module):
 
         # Optionally share Fourier coordinates with query tokens.
         if self.sensor_coord_encoding == "fourier" and self.pos_enc is not None:
-            sensor_coord_feat = self.pos_enc(obs_coords)
+            sensor_coord_feat = self.pos_enc(
+                self._positional_coordinates(obs_coords))
         else:
             sensor_coord_feat = obs_coords
 
@@ -1118,18 +1199,99 @@ class ConditionalPointHybridLocalGlobalRBF(nn.Module):
         # auto
         return LazyTensor is not None
 
+    def _minimum_image_delta(self, delta: torch.Tensor) -> torch.Tensor:
+        """Wrap tensor coordinate differences into each periodic half-cell."""
+        if not any(period > 0.0 for period in self.periodic_coord_periods):
+            return delta
+        parts = []
+        for dim, period in enumerate(self.periodic_coord_periods):
+            value = delta[..., dim:dim + 1]
+            if period > 0.0:
+                half_period = 0.5 * period
+                value = torch.remainder(value + half_period, period) - half_period
+            parts.append(value)
+        return torch.cat(parts, dim=-1)
+
+    def _pairwise_sqdist_torch(
+        self,
+        query_coords: torch.Tensor,
+        obs_coords: torch.Tensor,
+    ) -> torch.Tensor:
+        """Pairwise squared distance with exact periodic minimum images.
+
+        The all-Euclidean fast path deliberately remains the historical
+        ``torch.cdist`` expression so existing configurations retain their
+        original numerical behavior.
+        """
+        if not any(period > 0.0 for period in self.periodic_coord_periods):
+            return torch.cdist(query_coords, obs_coords, p=2.0).square()
+        d2 = query_coords.new_zeros(
+            query_coords.shape[0], query_coords.shape[1], obs_coords.shape[1])
+        for dim, period in enumerate(self.periodic_coord_periods):
+            delta = (query_coords[..., dim].unsqueeze(2)
+                     - obs_coords[..., dim].unsqueeze(1))
+            if period > 0.0:
+                half_period = 0.5 * period
+                delta = torch.remainder(
+                    delta + half_period, period) - half_period
+            d2 = d2 + delta.square()
+        return d2
+
+    def _pairwise_sqdist_keops(self, x_i, y_j):
+        """KeOps counterpart of :meth:`_pairwise_sqdist_torch`."""
+        delta = x_i - y_j
+        if not any(period > 0.0 for period in self.periodic_coord_periods):
+            return (delta ** 2).sum(-1)
+        d2 = None
+        for dim, period in enumerate(self.periodic_coord_periods):
+            component = delta[dim]
+            if period > 0.0:
+                # LazyTensor.mod(P, -P/2) maps to [-P/2, P/2), the exact
+                # minimum-image displacement even when inputs differ by more
+                # than one period.
+                component = component.mod(period, -0.5 * period)
+            term = component ** 2
+            d2 = term if d2 is None else d2 + term
+        return d2
+
+    def _positional_coordinates(self, coords: torch.Tensor) -> torch.Tensor:
+        """Scale periodic axes so Fourier features use the configured period."""
+        if not any(period > 0.0 for period in self.periodic_coord_periods):
+            return coords
+        return torch.cat([
+            coords[..., dim:dim + 1] / period
+            if period > 0.0 else coords[..., dim:dim + 1]
+            for dim, period in enumerate(self.periodic_coord_periods)
+        ], dim=-1)
+
     def _aggregate_rbf_keops(
         self,
         query_coords: torch.Tensor,         # [B, N, D]
         obs_coords: torch.Tensor,           # [B, M, D]
         refined_sensor_feat: torch.Tensor,  # [B, M, Cc]
         obs_mask: torch.Tensor,             # [B, M]
+        sigma: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Full RBF gather using KeOps sumsoftmaxweight, without building the dense [B, N, M] matrix.
         """
-        sigma = torch.exp(self.log_rbf_sigma).clamp_min(1e-6) if self.learnable_rbf_sigma else self.rbf_sigma
-        gamma = 1.0 / (2 * sigma ** 2 + 1e-12)
+        if sigma is None:
+            sigma = (torch.exp(self.log_rbf_sigma).clamp_min(1e-6)
+                     if self.learnable_rbf_sigma else self.rbf_sigma)
+
+        # KeOps full softmax masking needs a large finite logit penalty. Promote
+        # half/bfloat16 inputs so that 1e6 stays finite (0 * inf would otherwise
+        # produce NaNs on valid mask entries under mixed precision).
+        output_dtype = refined_sensor_feat.dtype
+        compute_dtype = query_coords.dtype
+        if compute_dtype in (torch.float16, torch.bfloat16):
+            compute_dtype = torch.float32
+        query_coords = query_coords.to(dtype=compute_dtype)
+        obs_coords = obs_coords.to(dtype=compute_dtype)
+        refined_sensor_feat = refined_sensor_feat.to(dtype=compute_dtype)
+        sigma_t = torch.as_tensor(
+            sigma, device=query_coords.device, dtype=compute_dtype)
+        gamma = 1.0 / (2 * sigma_t ** 2 + 1e-12)
 
         # KeOps requires contiguous inputs.
         query_coords = query_coords.contiguous()
@@ -1142,17 +1304,21 @@ class ConditionalPointHybridLocalGlobalRBF(nn.Module):
         v_j = LazyTensor(refined_sensor_feat[:, None, :, :])          # [B, 1, M, Cc]
 
         # Scalar logits: -gamma * ||x_i - y_j||^2
-        sqdist_ij = ((x_i - y_j) ** 2).sum(-1)                        # [B, N, M, 1]
+        sqdist_ij = self._pairwise_sqdist_keops(x_i, y_j)             # [B, N, M, 1]
         logits_ij = -gamma * sqdist_ij
 
-        # Mask invalid sensor slots by adding a large negative number
+        # Mask invalid sensor slots below every valid normalized-coordinate
+        # logit. A fixed -1e6 is insufficient when sigma becomes very small,
+        # because valid -d^2/(2 sigma^2) values can be even more negative.
         mask_j = LazyTensor(obs_mask[:, None, :, None].to(query_coords.dtype).contiguous())   # [B, 1, M, 1]
-        logits_ij = logits_ij + (mask_j - 1.0) * 1e6
+        sigma_for_mask = sigma_t.detach()
+        invalid_penalty = 1e6 + 1e6 / (2 * sigma_for_mask ** 2 + 1e-12)
+        logits_ij = logits_ij + (mask_j - 1.0) * invalid_penalty
 
         # Softmax-weighted sum over the sensor axis.
         # With one batch dimension, the j-axis is dim=2.
         local_cond = logits_ij.sumsoftmaxweight(v_j, dim=2)           # [B, N, Cc]
-        return local_cond
+        return local_cond.to(dtype=output_dtype)
 
     def _knn_search_keops(
         self,
@@ -1166,17 +1332,24 @@ class ConditionalPointHybridLocalGlobalRBF(nn.Module):
         Top-k neighbor search using KeOps Kmin_argKmin.
         """
 
-        # KeOps requires contiguous inputs.
-        query_coords = query_coords.contiguous()
-        obs_coords = obs_coords.contiguous()
+        # Distance search must remain finite for explicit half-precision
+        # coordinates. Both the 1e6 invalid-slot sentinel and squared
+        # distances can overflow fp16.
+        obs_coords_out = obs_coords
+        distance_dtype = query_coords.dtype
+        if distance_dtype in (torch.float16, torch.bfloat16):
+            distance_dtype = torch.float32
+        query_coords_dist = query_coords.to(dtype=distance_dtype).contiguous()
+        obs_coords_dist = obs_coords.to(dtype=distance_dtype).contiguous()
 
-        x_i = LazyTensor(query_coords[:, :, None, :])                 # [B, N, 1, D]
-        y_j = LazyTensor(obs_coords[:, None, :, :])                   # [B, 1, M, D]
+        x_i = LazyTensor(query_coords_dist[:, :, None, :])            # [B, N, 1, D]
+        y_j = LazyTensor(obs_coords_dist[:, None, :, :])              # [B, 1, M, D]
 
-        sqdist_ij = ((x_i - y_j) ** 2).sum(-1)                        # [B, N, M, 1]
+        sqdist_ij = self._pairwise_sqdist_keops(x_i, y_j)             # [B, N, M, 1]
 
         # Mask invalid sensor slots
-        mask_j = LazyTensor(obs_mask[:, None, :, None].to(query_coords.dtype).contiguous())
+        mask_j = LazyTensor(
+            obs_mask[:, None, :, None].to(distance_dtype).contiguous())
         sqdist_ij = sqdist_ij + (1.0 - mask_j) * 1e6
 
         # With one batch dimension, the j-axis is dim=2.
@@ -1186,7 +1359,7 @@ class ConditionalPointHybridLocalGlobalRBF(nn.Module):
         topk_idx = topk_idx.long()
 
         topk_sensor_feat = batched_gather_3d(refined_sensor_feat, topk_idx)
-        topk_sensor_coords = batched_gather_3d(obs_coords, topk_idx)
+        topk_sensor_coords = batched_gather_3d(obs_coords_out, topk_idx)
         topk_valid = batched_gather_2d(obs_mask, topk_idx).bool()
 
         return topk_d2, topk_sensor_feat, topk_sensor_coords, topk_valid
@@ -1202,14 +1375,20 @@ class ConditionalPointHybridLocalGlobalRBF(nn.Module):
         """
         Fallback KNN search using torch.cdist + torch.topk.
         """
-        d2 = torch.cdist(query_coords, obs_coords, p=2.0) ** 2
+        obs_coords_out = obs_coords
+        distance_dtype = query_coords.dtype
+        if distance_dtype in (torch.float16, torch.bfloat16):
+            distance_dtype = torch.float32
+        query_coords_dist = query_coords.to(dtype=distance_dtype)
+        obs_coords_dist = obs_coords.to(dtype=distance_dtype)
+        d2 = self._pairwise_sqdist_torch(query_coords_dist, obs_coords_dist)
         large = torch.full_like(d2, 1e6)
         d2 = torch.where(obs_mask.unsqueeze(1) > 0, d2, large)
 
         topk_d2, topk_idx = torch.topk(d2, k=k, dim=-1, largest=False)
 
         topk_sensor_feat = batched_gather_3d(refined_sensor_feat, topk_idx)
-        topk_sensor_coords = batched_gather_3d(obs_coords, topk_idx)
+        topk_sensor_coords = batched_gather_3d(obs_coords_out, topk_idx)
         topk_valid = batched_gather_2d(obs_mask, topk_idx).bool()
 
         return topk_d2, topk_sensor_feat, topk_sensor_coords, topk_valid
@@ -1279,7 +1458,8 @@ class ConditionalPointHybridLocalGlobalRBF(nn.Module):
         k = self.sensor_local_k(nbr_feat)                   # [B, M, Ks, Cc]
         v = self.sensor_local_v(nbr_feat)                   # [B, M, Ks, Cc]
 
-        rel = sensor_coords.unsqueeze(2) - nbr_coords       # [B, M, Ks, D]
+        rel = self._minimum_image_delta(
+            sensor_coords.unsqueeze(2) - nbr_coords)        # [B, M, Ks, D]
         rel_dist = torch.sqrt(nbr_d2.clamp_min(0.0)).unsqueeze(-1)  # [B, M, Ks, 1]
         pos = self.sensor_local_pos(torch.cat([rel, rel_dist], dim=-1))  # [B, M, Ks, Cc]
 
@@ -1304,7 +1484,8 @@ class ConditionalPointHybridLocalGlobalRBF(nn.Module):
         """Build point- or coordinate-based latent readout tokens."""
         if self.query_readout_type == "coord":
             bsz, n_query, _ = coords.shape
-            coord_feat = self.pos_enc(coords) if self.pos_enc is not None else coords
+            coord_feat = (self.pos_enc(self._positional_coordinates(coords))
+                          if self.pos_enc is not None else coords)
             dq = self.query_decoder_token.view(1, 1, -1).expand(bsz, n_query, -1)
             return self.query_readout_in(torch.cat([coord_feat, dq], dim=-1))
         return self.query_readout_in(point_feat)
@@ -1347,6 +1528,130 @@ class ConditionalPointHybridLocalGlobalRBF(nn.Module):
         )
         return self.coarse_head(coarse_feat)
 
+    @staticmethod
+    def _masked_neighbor_softmax(
+        logits: torch.Tensor,
+        valid: torch.Tensor,
+    ) -> torch.Tensor:
+        """Softmax over valid neighbors, returning zero for an empty field."""
+        logits = logits.masked_fill(~valid, -torch.inf)
+        weights = torch.softmax(logits, dim=-1)
+        # An observation batch may omit a physical field. softmax(all -inf) is
+        # NaN, so explicitly make that field contribute a zero feature.
+        weights = torch.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
+        weights = weights * valid.to(dtype=weights.dtype)
+        return weights / weights.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+
+    def _fieldwise_sigma(self, field_id: int) -> torch.Tensor:
+        """Return one field's RBF width in normalized model coordinates."""
+        if not self.fieldwise_rbf_gather:
+            raise RuntimeError("_fieldwise_sigma requires fieldwise_rbf_gather")
+        if self.learnable_rbf_sigma:
+            base = torch.exp(self.log_rbf_sigma).clamp_min(1e-6)
+        else:
+            base = self._fieldwise_rbf_scale.new_tensor(float(self.rbf_sigma))
+        return (base * self._fieldwise_rbf_scale[field_id]).clamp_min(1e-6)
+
+    def _aggregate_chunk_fieldwise(
+        self,
+        query_coords: torch.Tensor,
+        query_feat: torch.Tensor,
+        obs_coords: torch.Tensor,
+        refined_sensor_feat: torch.Tensor,
+        obs_mask: torch.Tensor,
+        obs_field_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Interpolate every physical field independently, then fuse.
+
+        Mixed-resolution observations must not share a neighbor search or RBF
+        normalization: otherwise the dense field takes spatially varying
+        probability mass from the coarse fields. Here each field receives its
+        own top-k set, bandwidth, and unit-mass softmax. The resulting features
+        are combined by a balanced mean, independent of sensor count.
+        """
+        field_features = []
+        field_present = []
+        dense_d2 = None
+        if self.gather_mode == "rbf" and not self._use_keops():
+            # Full fieldwise RBF is intentionally evaluated with a shared dense
+            # distance matrix. N19 uses top-k/KeOps; this path keeps the option
+            # correct for small point-cloud configurations as well.
+            distance_dtype = query_coords.dtype
+            if distance_dtype in (torch.float16, torch.bfloat16):
+                distance_dtype = torch.float32
+            dense_d2 = self._pairwise_sqdist_torch(
+                query_coords.to(distance_dtype),
+                obs_coords.to(distance_dtype))
+
+        for field_id in range(self.n_fields):
+            field_mask = (
+                obs_mask.bool() & (obs_field_ids.long() == int(field_id))
+            )
+            present = field_mask.any(dim=-1)
+            sigma = self._fieldwise_sigma(field_id).to(
+                device=query_coords.device, dtype=query_coords.dtype)
+
+            if self.gather_mode == "rbf":
+                if self._use_keops():
+                    local = self._aggregate_rbf_keops(
+                        query_coords=query_coords,
+                        obs_coords=obs_coords,
+                        refined_sensor_feat=refined_sensor_feat,
+                        obs_mask=field_mask,
+                        sigma=sigma,
+                    )
+                else:
+                    valid = field_mask.unsqueeze(1).expand(
+                        -1, query_coords.shape[1], -1)
+                    logits = -dense_d2 / (2 * sigma.square() + 1e-12)
+                    weights = self._masked_neighbor_softmax(logits, valid)
+                    local = torch.einsum(
+                        "bnm,bmd->bnd", weights,
+                        refined_sensor_feat.to(weights.dtype)).to(
+                            refined_sensor_feat.dtype)
+            else:
+                k = min(self.gather_topk, obs_coords.shape[1])
+                topk_d2, topk_sensor_feat, topk_sensor_coords, topk_valid = \
+                    self._get_topk_neighbors(
+                        query_coords=query_coords,
+                        obs_coords=obs_coords,
+                        refined_sensor_feat=refined_sensor_feat,
+                        obs_mask=field_mask,
+                        k=k,
+                    )
+                sigma_compute = sigma.to(dtype=topk_d2.dtype)
+                logits = -topk_d2 / (2 * sigma_compute.square() + 1e-12)
+
+                if self.gather_mode == "topk_rbf_gate":
+                    query_cond = self.query_to_cond(query_feat)
+                    query_cond = query_cond.unsqueeze(2).expand(-1, -1, k, -1)
+                    rel = self._minimum_image_delta(
+                        query_coords.unsqueeze(2) - topk_sensor_coords)
+                    rel_dist = torch.sqrt(
+                        topk_d2.clamp_min(0.0)).unsqueeze(-1)
+                    gate_in = torch.cat(
+                        [query_cond, topk_sensor_feat, rel, rel_dist], dim=-1)
+                    logits = logits + self.gather_gate(gate_in).squeeze(-1)
+
+                # Deliberately omit topk_rbf_glres's learned per-sensor logit
+                # bias here. Fieldwise mode keeps the local weights purely
+                # geometric; glres retains its global residual paths.
+                weights = self._masked_neighbor_softmax(logits, topk_valid)
+                local = torch.sum(
+                    weights.unsqueeze(-1) * topk_sensor_feat, dim=2).to(
+                        dtype=topk_sensor_feat.dtype)
+
+            local = local * present[:, None, None].to(dtype=local.dtype)
+            field_features.append(local)
+            field_present.append(present)
+
+        # Missing fields remain zero and are excluded from the balanced mean.
+        stacked = torch.stack(field_features, dim=2)
+        present = torch.stack(field_present, dim=1)
+        denom = present.sum(dim=1).clamp_min(1).to(stacked.dtype)
+        balanced = stacked.sum(dim=2) / denom[:, None, None]
+        return balanced
+
     def _aggregate_chunk(
         self,
         query_coords: torch.Tensor,         # [B, Nc, D]
@@ -1354,8 +1659,22 @@ class ConditionalPointHybridLocalGlobalRBF(nn.Module):
         obs_coords: torch.Tensor,           # [B, M, D]
         refined_sensor_feat: torch.Tensor,  # [B, M, Cc]
         obs_mask: torch.Tensor,             # [B, M]
+        obs_field_ids: Optional[torch.Tensor] = None,  # [B, M]
     ) -> torch.Tensor:
         """Aggregate one query chunk."""
+        if self.fieldwise_rbf_gather:
+            if obs_field_ids is None:
+                raise ValueError(
+                    "fieldwise_rbf_gather requires obs_field_ids for every sensor.")
+            return self._aggregate_chunk_fieldwise(
+                query_coords=query_coords,
+                query_feat=query_feat,
+                obs_coords=obs_coords,
+                refined_sensor_feat=refined_sensor_feat,
+                obs_mask=obs_mask,
+                obs_field_ids=obs_field_ids,
+            )
+
         sigma = torch.exp(self.log_rbf_sigma).clamp_min(1e-6) if self.learnable_rbf_sigma else self.rbf_sigma
 
         # Full RBF gather.
@@ -1368,13 +1687,21 @@ class ConditionalPointHybridLocalGlobalRBF(nn.Module):
                     obs_mask=obs_mask,
                 )
 
-            d2 = torch.cdist(query_coords, obs_coords, p=2.0) ** 2
+            distance_dtype = query_coords.dtype
+            if distance_dtype in (torch.float16, torch.bfloat16):
+                distance_dtype = torch.float32
+            d2 = self._pairwise_sqdist_torch(
+                query_coords.to(distance_dtype),
+                obs_coords.to(distance_dtype))
             large = torch.full_like(d2, 1e6)
             d2 = torch.where(obs_mask.unsqueeze(1) > 0, d2, large)
 
             logits = -d2 / (2 * sigma ** 2 + 1e-12)
             weights = torch.softmax(logits, dim=-1)
-            return torch.einsum("bnm,bmd->bnd", weights, refined_sensor_feat)
+            return torch.einsum(
+                "bnm,bmd->bnd", weights,
+                refined_sensor_feat.to(weights.dtype)).to(
+                    refined_sensor_feat.dtype)
 
         # Top-k gather modes.
         k = min(self.gather_topk, obs_coords.shape[1])
@@ -1402,7 +1729,8 @@ class ConditionalPointHybridLocalGlobalRBF(nn.Module):
             query_cond = self.query_to_cond(query_feat)                    # [B, Nc, Cc]
             query_cond = query_cond.unsqueeze(2).expand(-1, -1, k, -1)    # [B, Nc, k, Cc]
 
-            rel = query_coords.unsqueeze(2) - topk_sensor_coords           # [B, Nc, k, D]
+            rel = self._minimum_image_delta(
+                query_coords.unsqueeze(2) - topk_sensor_coords)            # [B, Nc, k, D]
             rel_dist = torch.sqrt(topk_d2.clamp_min(0.0)).unsqueeze(-1)    # [B, Nc, k, 1]
 
             gate_in = torch.cat([query_cond, topk_sensor_feat, rel, rel_dist], dim=-1)
@@ -1417,7 +1745,9 @@ class ConditionalPointHybridLocalGlobalRBF(nn.Module):
 
         logits = logits.masked_fill(~topk_valid, -1e9)
         weights = torch.softmax(logits, dim=-1)
-        local_cond = torch.sum(weights.unsqueeze(-1) * topk_sensor_feat, dim=2)
+        local_cond = torch.sum(
+            weights.unsqueeze(-1) * topk_sensor_feat, dim=2).to(
+                dtype=topk_sensor_feat.dtype)
         return local_cond
 
     def aggregate_sparse_obs(
@@ -1427,6 +1757,7 @@ class ConditionalPointHybridLocalGlobalRBF(nn.Module):
         obs_coords: torch.Tensor,
         refined_sensor_feat: torch.Tensor,
         obs_mask: torch.Tensor,
+        obs_field_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Gather enriched sensor features at query points."""
         n_query = query_coords.shape[1]
@@ -1445,6 +1776,7 @@ class ConditionalPointHybridLocalGlobalRBF(nn.Module):
                 obs_coords=obs_coords,
                 refined_sensor_feat=refined_sensor_feat,
                 obs_mask=obs_mask,
+                obs_field_ids=obs_field_ids,
             )
 
         outputs = []
@@ -1457,6 +1789,7 @@ class ConditionalPointHybridLocalGlobalRBF(nn.Module):
                 obs_coords=obs_coords,
                 refined_sensor_feat=refined_sensor_feat,
                 obs_mask=obs_mask,
+                obs_field_ids=obs_field_ids,
             )
             outputs.append(local_chunk)
 
@@ -1493,7 +1826,8 @@ class ConditionalPointHybridLocalGlobalRBF(nn.Module):
 
         # Query-point features.
         t_feat = t.view(bsz, 1, 1).expand(bsz, n_pts, 1)
-        coord_feat = self.pos_enc(coords) if self.use_fourier_pe else coords
+        coord_feat = (self.pos_enc(self._positional_coordinates(coords))
+                      if self.use_fourier_pe else coords)
         point_feat = self.point_encoder(torch.cat([coord_feat, x_t, t_feat], dim=-1))  # [B, N, H]
 
         # Local sensor tokens.
@@ -1541,6 +1875,7 @@ class ConditionalPointHybridLocalGlobalRBF(nn.Module):
                 obs_coords=obs_coords,
                 refined_sensor_feat=refined_sensor_feat,
                 obs_mask=obs_mask,
+                obs_field_ids=obs_field_ids,
             )  # [B, N, cond_dim]
 
             # Add a learned coarse residual from the global summary.
@@ -1564,6 +1899,7 @@ class ConditionalPointHybridLocalGlobalRBF(nn.Module):
             obs_coords=obs_coords,
             refined_sensor_feat=refined_sensor_feat,
             obs_mask=obs_mask,
+            obs_field_ids=obs_field_ids,
         )  # [B, N, cond_dim]
 
         # Final velocity prediction.

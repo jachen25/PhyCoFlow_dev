@@ -35,7 +35,9 @@ _TRAINING_PROTOCOL_KEYS = frozenset({
     "select_fields", "irregular_mesh", "seed", "epochs", "batch_size", "lr",
     "weight_decay", "train_ratio", "time_stride", "num_workers",
     "train_ratio_downsample", "hidden_dim", "cond_dim", "field_embed_dim",
-    "rbf_sigma", "backbone", "latent_dim", "num_latents", "num_heads",
+    "rbf_sigma", "rbf_sigma_per_field", "fieldwise_rbf_gather",
+    "periodic_coord_periods", "backbone",
+    "latent_dim", "num_latents", "num_heads",
     "num_latent_blocks", "ff_mult", "attn_dropout", "mlp_dropout",
     "decode_chunk_size", "share_query_proj", "summary_type", "adaptive_rbf_sigma",
     "adaptive_rbf_scale", "use_fourier_pe", "pe_num_bands", "pe_max_freq",
@@ -44,7 +46,9 @@ _TRAINING_PROTOCOL_KEYS = frozenset({
     "enhanced_head_norm", "glres_scale_init", "Num_x", "Num_y",
     "n_query_points", "prior", "rff_features", "rff_lengthscale", "sigma_min",
     "cond_field", "cond_fields", "n_obs_min", "n_obs_max", "n_obs_min_list",
-    "n_obs_max_list", "use_ema", "ema_decay", "training_mode",
+    "n_obs_max_list", "obs_grid_stride_list", "vis_obs_grid_stride_list",
+    "obs_grid_pool",
+    "obs_grid_pool_physical", "use_ema", "ema_decay", "training_mode",
     "initialization", "pretrained_run_dir", "pretrained_source_Demo_Num",
     "pretrained_checkpoint", "pretrained_min_epoch", "pretrained_load_optimizer",
     "pretrained_strict", "pretrained_use_source_base_config",
@@ -149,6 +153,9 @@ def evaluation_protocol(args, sensor_layout=None):
         "ae_data_root", "ae_protocol", "ae_fields", "ae_flow_transform",
         "seed", "vis_cond_fields", "vis_n_obs_list")
     protocol = {key: getattr(args, key) for key in required}
+    protocol["vis_obs_grid_stride_list"] = getattr(
+        args, "vis_obs_grid_stride_list",
+        getattr(args, "obs_grid_stride_list", None))
     protocol.update({key: getattr(args, key, default)
                      for key, default in defaults.items()})
     if sensor_layout is not None:
@@ -344,7 +351,9 @@ def main():
         frame_downsample=(a.split == "train" and bool(getattr(
             args_ref, "ae_frame_downsample", False))),
         frame_tau=float(getattr(args_ref, "ae_frame_tau", 0.02)),
-        frame_min=int(getattr(args_ref, "ae_frame_min", 4)))
+        frame_min=int(getattr(args_ref, "ae_frame_min", 4)),
+        pool_observations_physical=bool(getattr(
+            args_ref, "obs_grid_pool_physical", False)))
     validate_checkpoint_dataset_provenance(
         [(tag, ck) for tag, _, _, ck, _ in arms], ds)
     H = W = ds.grid_Nx

@@ -36,6 +36,7 @@ from helpers import (
     create_recon_dir,
     visualize_reconstruction,
     build_sparse_condition,
+    resolve_pooled_value_transform,
 )
 from Model import (
     ConditionalPointFFM,
@@ -192,7 +193,8 @@ def parse_args():
     )
     p.add_argument(
         "--gather-topk", type=int, default=32,
-        help="Number of nearest refined sensor tokens used in top-k gather modes.",
+        help="Number of nearest refined sensor tokens used in top-k gather modes "
+             "(per physical field when fieldwise_rbf_gather is enabled).",
     )
     p.add_argument(
         "--gather-query-chunk-size", type=int, default=None,
@@ -201,6 +203,25 @@ def parse_args():
     p.add_argument(
         "--learnable-rbf-sigma", action="store_true",
         help="If set, make the RBF sigma in the hybrid gather learnable.",
+    )
+    p.add_argument(
+        "--fieldwise-rbf-gather", action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Gather and RBF-normalize each physical field independently. "
+             "Required for heterogeneous per-field sensor lattices so a dense "
+             "field cannot crowd sparse fields out of top-k/softmax.",
+    )
+    p.add_argument(
+        "--rbf-sigma-per-field", type=float, nargs="+", default=None,
+        help="RBF bandwidth for every model field, in normalized model-coordinate "
+             "units. Requires --fieldwise-rbf-gather; length must equal the "
+             "number of output fields.",
+    )
+    p.add_argument(
+        "--periodic-coord-periods", type=float, nargs="+", default=None,
+        help="One period per model-coordinate dimension (0 = non-periodic). "
+             "Periodic dimensions use exact minimum-image distance; length "
+             "must equal coord_dim.",
     )
     p.add_argument(
         "--adaptive-rbf-sigma", action="store_true",
@@ -344,9 +365,28 @@ def parse_args():
                         "centroids, the upstream SuperResolution operator) "
                         "instead of the value at the lattice node. Applies to "
                         "training and visualization strided fields; requires "
-                        "a stride > 1 in obs_grid_stride_list. Sampling then "
-                        "auto-uses endpoint_smooth consistency (block means "
-                        "must never be hard-clamped into single pixels).")
+                        "a stride > 1 in obs_grid_stride_list. Sampling defaults "
+                        "to raw conditional generation ('none'); block means "
+                        "must never be hard-clamped into single pixels.")
+    p.add_argument(
+        "--obs-grid-pool-physical", action=argparse.BooleanOptionalAction,
+        default=False,
+        help="For datasets with nonlinear field transforms, average pooled "
+             "blocks in raw physical units and normalize the block mean "
+             "afterward. Active Emulsion N19 uses this idealized PIV-window "
+             "proxy; the default preserves legacy model-space pooling.",
+    )
+
+    # Pooled block means are not pointwise targets. Keep smooth endpoint
+    # guidance available only as an explicit visualization diagnostic.
+    p.add_argument("--vis-obs-consistency-mode", type=str, default=None,
+                   choices=["none", "default_hard", "endpoint", "endpoint_smooth"],
+                   help="Consistency mode for training reconstruction panels. "
+                        "Defaults to 'none' for pooled observations and "
+                        "'default_hard' otherwise.")
+    p.add_argument("--vis-obs-consistency-strength", type=float, default=1.0)
+    p.add_argument("--vis-obs-consistency-sigma", type=float, default=None)
+    p.add_argument("--vis-obs-consistency-schedule-power", type=float, default=2.0)
 
     p.add_argument("--vis-cond-fields", type=int, nargs="+", default=None,
                    help="Visualization conditioned fields. Defaults to cond_fields.")
@@ -815,6 +855,30 @@ def parse_args():
 
     return p.parse_args()
 
+
+def _vis_obs_consistency_kwargs(args) -> dict:
+    """Sampling controls for training-time reconstruction panels.
+
+    A pooled block mean is not a field value at any one pixel. Raw conditional
+    sampling therefore avoids re-imprinting the coarse lattice through either
+    a point clamp or a Gaussian endpoint-guidance map.
+    """
+    pooled = bool(getattr(args, "obs_grid_pool", False))
+    mode = getattr(args, "vis_obs_consistency_mode", None)
+    if mode is None:
+        mode = "none" if pooled else "default_hard"
+    kwargs = {
+        "obs_consistency_mode": str(mode),
+        "obs_consistency_strength": float(
+            getattr(args, "vis_obs_consistency_strength", 1.0)),
+        "obs_consistency_schedule_power": float(
+            getattr(args, "vis_obs_consistency_schedule_power", 2.0)),
+    }
+    sigma = getattr(args, "vis_obs_consistency_sigma", None)
+    if sigma is not None:
+        kwargs["obs_consistency_sigma"] = float(sigma)
+    return kwargs
+
 def set_seed(seed: int) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -839,6 +903,11 @@ def normalize_conditioning_args(args):
 
     # Mean-pooled coarse observation (block means instead of node values).
     args.obs_grid_pool = bool(getattr(args, "obs_grid_pool", False))
+    args.obs_grid_pool_physical = bool(getattr(
+        args, "obs_grid_pool_physical", False))
+    if args.obs_grid_pool_physical and not args.obs_grid_pool:
+        raise ValueError(
+            "obs_grid_pool_physical=true requires obs_grid_pool=true.")
     if args.obs_grid_pool and not any(
             int(s) > 1 for s in args.obs_grid_stride_list):
         raise ValueError(
@@ -1064,6 +1133,8 @@ def run_epoch(
     # are actually active.
     grid_ny, grid_nx = resolve_stride_grid(
         obs_grid_strides, getattr(loader, "dataset", None), grid_ny, grid_nx)
+    pool_value_transform = resolve_pooled_value_transform(
+        getattr(loader, "dataset", None)) if obs_grid_pool else None
 
     total = 0.0
     count = 0
@@ -1093,6 +1164,7 @@ def run_epoch(
             Nx=grid_nx,
             obs_grid_strides=obs_grid_strides,
             obs_grid_pool=obs_grid_pool,
+            pool_value_transform=pool_value_transform,
         )
 
         # Full-grid models cannot subsample query points.
@@ -1265,6 +1337,7 @@ SOURCE_BASE_CONFIG_KEYS = (
     "latent_dim", "num_latents", "num_heads", "num_latent_blocks", "ff_mult",
     "attn_dropout", "mlp_dropout", "decode_chunk_size", "share_query_proj", "summary_type",
     "gather_mode", "gather_topk", "gather_query_chunk_size", "learnable_rbf_sigma",
+    "fieldwise_rbf_gather", "rbf_sigma_per_field", "periodic_coord_periods",
     "neighbor_backend",
     # Enhanced GL_rbf options.
     "use_fourier_pe", "pe_num_bands", "pe_max_freq",
@@ -1279,7 +1352,7 @@ SOURCE_BASE_CONFIG_KEYS = (
     "sigma_min", "prior", "rff_features", "rff_lengthscale",
     # Sparse conditioning.
     "cond_field", "cond_fields", "n_obs_min", "n_obs_max", "n_obs_min_list", "n_obs_max_list",
-    "obs_grid_stride_list", "obs_grid_pool",
+    "obs_grid_stride_list", "obs_grid_pool", "obs_grid_pool_physical",
     # Shape-affecting parameter-conditioning settings.
     "param_conditioning", "param_n_freq", "param_embed_hidden",
 )
@@ -2264,6 +2337,9 @@ def run_epoch_direct_coherence(model, loader, optimizer, device, args, direct_cf
     _dc_grid_ny, _dc_grid_nx = resolve_stride_grid(
         getattr(args, "obs_grid_stride_list", None),
         getattr(loader, "dataset", None))
+    _dc_pool_value_transform = resolve_pooled_value_transform(
+        getattr(loader, "dataset", None)) \
+        if bool(getattr(args, "obs_grid_pool", False)) else None
     rows = []
     every = max(1, int(args.coherence_every_n_steps))
     constrained = constrained_mode_active(args)
@@ -2293,7 +2369,8 @@ def run_epoch_direct_coherence(model, loader, optimizer, device, args, direct_cf
             sensor_layout=str(getattr(args, "sensor_layout", "independent")),
             Ny=_dc_grid_ny, Nx=_dc_grid_nx,
             obs_grid_strides=getattr(args, "obs_grid_stride_list", None),
-            obs_grid_pool=bool(getattr(args, "obs_grid_pool", False)))
+            obs_grid_pool=bool(getattr(args, "obs_grid_pool", False)),
+            pool_value_transform=_dc_pool_value_transform)
 
         # RF data loss.
         eff_nq = None if getattr(model, "requires_full_grid", False) else args.n_query_points
@@ -2606,9 +2683,11 @@ def main():
     script_dir = os.path.dirname(os.path.realpath(__file__))
     demo_dir = os.path.dirname(script_dir)
 
-    # Load and archive the YAML configuration.
+    # Load the YAML now; archive it only after resume discovery confirms there
+    # is work to do (completed resubmissions should be write-free).
     config_path = os.path.join(demo_dir, args.config)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    config_backup_path = None
 
     # Track explicitly configured keys.
     yaml_config = {}
@@ -2629,12 +2708,10 @@ def main():
                     print(f"Warning: YAML key '{key}' is not a recognized argument. Ignoring.")
         args = normalize_conditioning_args(args)
 
-        # Archive the input YAML by dataset.
+        # Defer the copy until after the completed-run guard below.
         backup_dir = os.path.join(demo_dir, "Save_config", args.dataset, "pointcloud_ffm")
-        os.makedirs(backup_dir, exist_ok=True)
         backup_filename = f"config_pointcloud_ffm_DemoN{args.Demo_Num}_{timestamp}.yaml"
-        shutil.copy(config_path, os.path.join(backup_dir, backup_filename))
-        print(f"[*] Config backed up to: {os.path.join(backup_dir, backup_filename)}\n")
+        config_backup_path = os.path.join(backup_dir, backup_filename)
     else:
         print(f"\n[Warning: !] Config file not found at {config_path}. Using default parameters.\n")
         args.Demo_Num = 0
@@ -2728,6 +2805,11 @@ def main():
                 validate_pretrained_epoch(
                     {"epoch": source_epoch}, required_source_epoch, source_checkpoint)
 
+            if start_epoch > int(args.epochs):
+                print(f"[*] Run already completed epoch {start_epoch - 1} "
+                      f"(configured epochs={args.epochs}); nothing to resume.")
+                return
+
             backup_existing_artifact(resume_ckpt_path)
             if resume_ckpt_path.name != "best.pt":
                 backup_existing_artifact(latest_run_dir / "best.pt")
@@ -2738,6 +2820,11 @@ def main():
             fallback = (f"warm-starting from {source_checkpoint}"
                         if source_checkpoint is not None else "starting from scratch")
             print(f"[*] RELOAD=True, but no current checkpoint was found; {fallback}.\n")
+
+    if config_backup_path is not None:
+        os.makedirs(os.path.dirname(config_backup_path), exist_ok=True)
+        shutil.copy(config_path, config_backup_path)
+        print(f"[*] Config backed up to: {config_backup_path}\n")
 
     save_dir.mkdir(parents=True, exist_ok=True)
 
@@ -2753,16 +2840,11 @@ def main():
     recon_base_dir = os.path.join(demo_dir, "Save_reconstruction_files", args.dataset)
     method_name = "ffm_pointcloud"
 
-    if args.RELOAD and reload_ckpt is not None:
-        loss_dir = Path(csv_base_dir) / f"Loss_DemoN{args.Demo_Num}_{run_timestamp}"
-        recon_dir_existing = Path(recon_base_dir) / method_name / f"demo_N{args.Demo_Num}_{run_timestamp}"
-
-        backup_existing_artifact(loss_dir)
-        backup_existing_artifact(recon_dir_existing)
-
     # Initialize logging and reconstruction output.
     logger = MetricsLogger(base_dir=csv_base_dir, Demo_Num=args.Demo_Num, timestamp=run_timestamp,
-                           method_name="PointCloudFFM")
+                           method_name="PointCloudFFM",
+                           resume_through_epoch=(start_epoch - 1)
+                           if reload_ckpt is not None else None)
     recon_dir = create_recon_dir(base_dir=recon_base_dir, Demo_Num=args.Demo_Num, timestamp=run_timestamp,
                                  method_name=method_name)
 
@@ -2920,14 +3002,22 @@ def main():
             seed=args.seed, flow_transform=args.ae_flow_transform,
             frame_downsample=args.ae_frame_downsample,
             frame_tau=args.ae_frame_tau, frame_min=args.ae_frame_min,
-            augment=args.ae_augment)
+            augment=args.ae_augment,
+            pool_observations_physical=args.obs_grid_pool_physical)
         # Validation uses the full, unaugmented split.
         val_set = ActiveEmulsionDataset(
             args.ae_data_root, split="val", protocol=args.ae_protocol,
             splits_path=args.ae_splits_path, fields=tuple(args.ae_fields),
-            seed=args.seed, flow_transform=args.ae_flow_transform)
+            seed=args.seed, flow_transform=args.ae_flow_transform,
+            pool_observations_physical=args.obs_grid_pool_physical)
     else:
         raise ValueError(f"Unknown dataset: {args.dataset}")
+
+    if (args.obs_grid_pool_physical
+            and resolve_pooled_value_transform(train_set) is None):
+        raise ValueError(
+            "obs_grid_pool_physical=true, but the selected dataset does not "
+            "provide the required physical pooling transform contract.")
 
     print(f"[*] Dataset class: {type(train_set).__name__}  irregular={irregular}  "
           f"train={len(train_set)}  val={len(val_set)}")
@@ -3025,7 +3115,10 @@ def main():
             f"query_readout_type={query_readout_type}, "
             f"query_readout_scale_init={query_readout_scale_init}, "
             f"enhanced_head_norm={enhanced_head_norm}, "
-            f"glres_scale_init={glres_scale_init}"
+            f"glres_scale_init={glres_scale_init}, "
+            f"fieldwise_rbf_gather={args.fieldwise_rbf_gather}, "
+            f"rbf_sigma_per_field={args.rbf_sigma_per_field}, "
+            f"periodic_coord_periods={args.periodic_coord_periods}"
         )
 
         backbone = ConditionalPointHybridLocalGlobalRBF(
@@ -3048,6 +3141,9 @@ def main():
             gather_topk=args.gather_topk,
             gather_query_chunk_size=args.gather_query_chunk_size,
             learnable_rbf_sigma=args.learnable_rbf_sigma,
+            fieldwise_rbf_gather=args.fieldwise_rbf_gather,
+            rbf_sigma_per_field=args.rbf_sigma_per_field,
+            periodic_coord_periods=args.periodic_coord_periods,
             adaptive_rbf_sigma=args.adaptive_rbf_sigma,
             adaptive_rbf_scale=args.adaptive_rbf_scale,
             neighbor_backend=args.neighbor_backend,
@@ -3633,6 +3729,18 @@ def main():
                 "method": "1_rectified_flow",
                 "backbone": args.backbone,
                 "summary_type": args.summary_type,
+                "fieldwise_rbf_gather": bool(args.fieldwise_rbf_gather),
+                "rbf_sigma": float(args.rbf_sigma),
+                "rbf_sigma_per_field": (
+                    [float(v) for v in args.rbf_sigma_per_field]
+                    if args.rbf_sigma_per_field is not None else None),
+                "periodic_coord_periods": (
+                    [float(v) for v in args.periodic_coord_periods]
+                    if args.periodic_coord_periods is not None else None),
+                "obs_grid_stride_list": [
+                    int(v) for v in args.obs_grid_stride_list],
+                "obs_grid_pool": bool(args.obs_grid_pool),
+                "obs_grid_pool_physical": bool(args.obs_grid_pool_physical),
                 "ode_solver": args.ode_solver,
                 "Num_x": args.Num_x,
                 "Num_y": args.Num_y,
@@ -3763,6 +3871,7 @@ def main():
                         save_metrics_json=True, sensor_layout=args.sensor_layout,
                         obs_grid_strides=args.vis_obs_grid_stride_list,
                         obs_grid_pool=bool(getattr(args, "obs_grid_pool", False)),
+                        **_vis_obs_consistency_kwargs(args),
                     )
                     metric_str = ", ".join(
                         f"{k}:{v:.4e}" for k, v in recon_metrics.items())

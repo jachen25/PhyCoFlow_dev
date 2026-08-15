@@ -85,6 +85,40 @@ def test_pooled_block_means_exact():
     print("PASS  pooled block means exact (values, centroids, rep nodes)")
 
 
+def test_physical_pooling_precedes_nonlinear_transform():
+    """Literal PIV means are averaged in raw velocity units before asinh."""
+    class AsinhAdapter:
+        pool_observations_physical = True
+
+        @staticmethod
+        def denormalize(z):
+            return torch.sinh(z)
+
+        @staticmethod
+        def normalize_field(values, field_id):
+            assert field_id == 0
+            return torch.asinh(values)
+
+    N, stride = 4, 4
+    coords, _, _ = _grid_batch(N=N, C=1, bsz=1)
+    raw = torch.tensor(
+        [0.0] * 15 + [16.0], dtype=torch.float32).reshape(1, N * N, 1)
+    normalized = torch.asinh(raw)
+    _, physical_obs, _, _, _ = build_sparse_condition(
+        coords_full=coords, fields_full=normalized,
+        cond_fields=[0], n_obs_min=[1], n_obs_max=[1],
+        Ny=N, Nx=N, obs_grid_strides=[stride], obs_grid_pool=True,
+        pool_value_transform=AsinhAdapter())
+    _, model_space_obs, _, _, _ = build_sparse_condition(
+        coords_full=coords, fields_full=normalized,
+        cond_fields=[0], n_obs_min=[1], n_obs_max=[1],
+        Ny=N, Nx=N, obs_grid_strides=[stride], obs_grid_pool=True)
+    expected = torch.asinh(raw.mean())
+    assert torch.allclose(physical_obs[0, 0, 0], expected, atol=1e-7)
+    assert not torch.allclose(physical_obs, model_space_obs, atol=1e-3)
+    print("PASS  physical block mean precedes nonlinear velocity transform")
+
+
 def test_pooled_permuted_points():
     """Verify pooling under arbitrary point ordering."""
     N, s = 16, 4
@@ -243,9 +277,10 @@ def test_pooled_error_paths():
 
 def test_pooled_clamp_guard():
     """Verify observation-consistency settings for pooled values."""
-    # Pooled observations use smooth endpoints without a final clamp.
+    # The generic hard default becomes raw sampling. An explicit endpoint
+    # request is made clamp-free/smooth; final clamping is always disabled.
     assert resolve_pooled_obs_consistency("default_hard", True, True) == \
-        ("endpoint_smooth", False)
+        ("none", False)
     assert resolve_pooled_obs_consistency("endpoint", True, True) == \
         ("endpoint_smooth", False)
     assert resolve_pooled_obs_consistency("endpoint_smooth", True, True) == \
@@ -255,7 +290,7 @@ def test_pooled_clamp_guard():
     # Non-pooled settings pass through unchanged.
     assert resolve_pooled_obs_consistency("default_hard", True, False) == \
         ("default_hard", True)
-    print("PASS  pooled clamp guard (endpoint_smooth forced, final clamp off)")
+    print("PASS  pooled clamp guard (raw default, smooth opt-in, final clamp off)")
 
 
 def test_config_surface_wiring_pool():
@@ -391,6 +426,64 @@ def test_config_surface_wiring_n18():
     print("PASS  config surface wiring (N18 joint-SR YAML)")
 
 
+def test_gather_bandwidth_matches_sensor_spacing():
+    """N19 must fix the gather while retaining mixed sensor resolutions."""
+    import os
+    import yaml
+
+    N = 128
+
+    def lattice(stride):
+        nb = N // stride
+        c = (torch.arange(nb) * stride + (stride - 1) // 2).float() / (N - 1)
+        gy, gx = torch.meshgrid(c, c, indexing="ij")
+        return torch.stack([gx.reshape(-1), gy.reshape(-1)], -1)
+
+    yy, xx = torch.meshgrid(torch.linspace(0, 1, N), torch.linspace(0, 1, N),
+                            indexing="ij")
+    queries = torch.stack([xx.reshape(-1), yy.reshape(-1)], -1)
+
+    def velocity_weight_swing(v_stride, sigma, phi_stride=8, k=32):
+        """Measure coarse-velocity mass variation under a shared gather."""
+        phi, vel = lattice(phi_stride), lattice(v_stride)
+        sensors = torch.cat([phi, vel, vel], 0)
+        is_velocity = torch.cat(
+            [torch.zeros(len(phi)), torch.ones(2 * len(vel))]).bool()
+        top_d2, top_idx = torch.topk(
+            torch.cdist(queries, sensors) ** 2,
+            min(k, sensors.shape[0]), largest=False)
+        weights = torch.softmax(-top_d2 / (2 * sigma ** 2), -1)
+        velocity_mass = (weights * is_velocity[top_idx]).sum(-1)
+        return float(velocity_mass.max()
+                     / velocity_mass.clamp_min(1e-12).min())
+
+    narrow = velocity_weight_swing(16, 0.0362)
+    wide = velocity_weight_swing(16, 0.063)
+    assert narrow > 3.0, f"expected a large swing at sigma=0.036, got {narrow:.2f}"
+    assert wide < 1.5, f"expected a flat gather at sigma=0.063, got {wide:.2f}"
+    assert narrow > 2 * wide, "widening the kernel must flatten the gather"
+
+    cfg_dir = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "Save_config", "active_emulsion")
+    with open(os.path.join(
+            cfg_dir, "config_pointcloud_ffm_N19_joint_sr_dense.yaml")) as f:
+        cfg = yaml.safe_load(f)
+    strides = [int(s) for s in cfg["obs_grid_stride_list"]]
+    sigmas = [float(v) for v in cfg["rbf_sigma_per_field"]]
+    assert strides == [8, 16, 16]
+    expected = [s / (N - 1) for s in strides]
+    assert max(abs(a - b) for a, b in zip(sigmas, expected)) < 1e-8
+    assert cfg["fieldwise_rbf_gather"] is True
+    assert cfg["learnable_rbf_sigma"] is False
+    assert cfg["cond_fields"] == [0, 1, 2] and cfg["obs_grid_pool"] is True
+    assert cfg["obs_grid_pool_physical"] is True
+    assert (len(cfg["cond_fields"]) == len(cfg["obs_grid_stride_list"])
+            == len(cfg["n_obs_min_list"]) == len(cfg["n_obs_max_list"]))
+    print(f"PASS  fieldwise bandwidth vs sensor spacing (shared narrow swing "
+          f"{narrow:.1f}x -> {wide:.1f}x widened; N19 strides {strides})")
+
+
 def test_pooled_registers_subnode_structure():
     """Verify sensitivity to structure between decimated lattice nodes."""
     N, s = 16, 8
@@ -422,6 +515,7 @@ def test_pooled_registers_subnode_structure():
 
 if __name__ == "__main__":
     test_pooled_block_means_exact()
+    test_physical_pooling_precedes_nonlinear_transform()
     test_pooled_permuted_points()
     test_pooled_ragged_edges()
     test_pooled_valid_mask()
@@ -432,5 +526,6 @@ if __name__ == "__main__":
     test_config_surface_wiring_pool()
     test_pooled_multi_stride_joint()
     test_config_surface_wiring_n18()
+    test_gather_bandwidth_matches_sensor_spacing()
     test_pooled_registers_subnode_structure()
     print("\nALL GATES PASS")
