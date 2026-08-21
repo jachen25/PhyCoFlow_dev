@@ -16,10 +16,7 @@ import torch.nn as nn
 
 import train_pointcloud_ffm as tpf
 
-CONFIG_REL = (
-    "Save_config/active_emulsion/"
-    "config_pointcloud_ffm_selfmutObs_posttrain_N12_piv.yaml"
-)
+CONFIG_REL = "Save_config/turbulent_combustion/config_pointcloud_ffm_direct_posttrain.yaml"
 
 
 def build_args():
@@ -27,7 +24,8 @@ def build_args():
     script_dir = os.path.dirname(os.path.realpath(__file__))
     demo_dir = os.path.dirname(script_dir)
     cfg_abs = os.path.join(demo_dir, CONFIG_REL)
-    sys.argv = ["diagnose", "--config", CONFIG_REL]
+    # Match the configured DemoN5 invocation.
+    sys.argv = ["diagnose", "--config", CONFIG_REL, "--Demo-Num", "5"]
     args = tpf.parse_args()
     with open(cfg_abs, "r") as f:
         import yaml
@@ -166,7 +164,7 @@ def main():
     if valid_mask is not None:
         valid_mask = valid_mask.to(device)
 
-    # Hold sparse observations constant.
+    # Fix sparse observations once.
     torch.manual_seed(123)
     obs_coords, obs_values, obs_mask, obs_indices, obs_field_ids = tpf.build_sparse_condition(
         coords_full=coords_full, fields_full=fields_full, cond_fields=args.cond_fields,

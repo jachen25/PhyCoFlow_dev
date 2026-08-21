@@ -59,7 +59,7 @@ def superlevel_h0(f: np.ndarray, periodic: bool = True) -> dict:
         birth[i] = v
         size[i] = 1
         if not nbr_roots:
-            continue                                    # Start a component at this maximum.
+            continue                                    # New local maximum.
         elder = max(nbr_roots, key=lambda rt: birth[rt])
         parent[i] = elder
         size[elder] += 1

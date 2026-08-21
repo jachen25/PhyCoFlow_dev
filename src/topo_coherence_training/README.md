@@ -35,15 +35,10 @@ Zero-weight self or mutual cells are skipped.
 
 The N13 treatment configuration is
 `Save_config/active_emulsion/config_pointcloud_ffm_selfmutObs_posttrain_N12_piv.yaml`.
-It warm-starts the frozen N12 checkpoint named in the configuration and keeps the
-rectified-flow data loss active:
+It warm-starts the completed N12 baseline and keeps the rectified-flow data loss active:
 
 ```text
-minimize  L_topo
-subject to  L_RF <= epsilon_data
-            L_anchor <= epsilon_anchor
-
-L_primal = (k / L_topo,0) L_topo + mu_data L_RF + mu_anchor L_anchor
+L = L_RF + lambda * Balance({w_i L_i})
 
 {L_i} = phi self H0/H1 mean and variance
       + reference-anchored phi-vorticity H0/H1 and spatial terms
@@ -62,15 +57,13 @@ The configured path uses:
   overlap in high/low anchor partitions;
 - physical residual matching for `w = alpha * curl(v)` and `div(v)` after
   denormalization; and
-- antialiased 128-to-64 topology rasterization and an 8-step Euler training rollout
-  with hard clamping at co-located `vx`/`vy` sensors. In-training Pareto coherence
-  also uses `epi_rollout_steps=8`; standalone held-out evaluation defaults to 32 NFE.
+- antialiased 128-to-64 topology rasterization and a full-grid, 32-step Euler rollout
+  with hard clamping at co-located `vx`/`vy` sensors.
 
 Explicit component weights are followed by detached inverse-gradient EMA scaling.
-Projected dual ascent updates the data and frozen-model anchor multipliers from
-EMA-smoothed constraint violations. Topology is evaluated every eight steps; the
-normalized objective is cadence-scaled while constraint updates remain active on the
-intervening steps.
+The outer topology weight is probed and periodically adapted from data/topology
+gradient norms. Training applies topology every eight steps without interval
+amplification and retains the RF objective on every step.
 
 The model also receives the known `(H, R, m)` parameters. The dense velocity anchor and
 field reference are training targets; inference conditions on sparse velocity sensors.
@@ -83,8 +76,8 @@ The matched data-only control is
   padding of a planar cubical complex. This approximates periodic boundaries but is not
   a translation-invariant torus construction.
 - Unmatched target H1 bars in paired induced matching contribute a constant penalty and
-  no creation gradient. The active path does not include an explicit unmatched-H1
-  creation term.
+  no creation gradient. `topo_birth.py` supplies optional missing-H0 creation terms, not
+  missing-H1 creation.
 - Marginal self training matches per-stratum Betti-curve means and variances. It does
   not match the full conditional persistence-diagram distribution.
 - The observed mutual curve term conditions topology through anchor level sets. It does
@@ -98,6 +91,9 @@ The matched data-only control is
 - Periodic Betti counts use an exact hard forward pass with a biased straight-through
   gradient; exact changes can require crossing a finite filtration threshold.
 
+For the full N12 audit, experiment protocol, and operational checkpoint status, see
+[`TOPOLOGICAL_POSTTRAIN_REVIEW_N12.md`](../../TOPOLOGICAL_POSTTRAIN_REVIEW_N12.md).
+
 ## File map
 
 | Path | Role |
@@ -108,12 +104,16 @@ The matched data-only control is
 | `src/topo_coherence_training/betti_matching.py` | Paired induced matching and live critical-value gradients. |
 | `src/topo_coherence_training/betti_matching_ref.py` | Vendored cubical-persistence backend. |
 | `src/topo_coherence_training/mph_fibered.py` | Filtration providers, admissible slices, and fibered losses. |
+| `src/topo_coherence_training/topo_birth.py` | Optional H0 creation losses. |
 | `src/topological_coherence_2/diff_persistence.py` | Grid graph and persistence primitives. |
 | `src/direct_coherence_loss.py` | Differentiable rollout and loss bridge. |
 | `src/physics_coherence.py` | `w`-curl and divergence consistency losses. |
 | `src/train_pointcloud_ffm.py` | Active-emulsion post-training, references, checkpoints, and validation hooks. |
 | `src/coherence_eval.py` | Held-out topology, physical, and paired-arm metrics. |
 | `src/evaluate_topo_coherence_test.py` | Deployed-sampler held-out evaluation entry point. |
+
+`topo_ffm.py` and `train_topo_ffm.py` implement a separate turbulent-combustion trainer;
+they are not the N12 active-emulsion post-training path.
 
 ## Compatibility aliases
 

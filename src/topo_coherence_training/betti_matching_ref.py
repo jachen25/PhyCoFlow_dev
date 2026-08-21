@@ -1,14 +1,14 @@
-"""Vendored cubical-persistence implementation from Stucki et al.
-
-Plotting, representative-cycle, and Wasserstein utilities are omitted.
-"""
-
 import numpy as np
 import torch
 import heapq
 import copy
 import random as rd
 from operator import itemgetter
+# Vendored from the Stucki et al. Betti-matching reference implementation.
+# Plotting, representative-cycle, and Wasserstein code have been removed;
+# restore from upstream if needed.
+
+
 class UnionFind:
     def __init__(self, n, dual=False):
         self.n = n
@@ -22,7 +22,7 @@ class UnionFind:
         self.birth[x] = val
         return
 
-
+    
     def get_birth(self, x):
         y = self.find(x)
         return self.birth[y]
@@ -41,7 +41,7 @@ class UnionFind:
             y = self.parent[x]
         return z
 
-
+    
     def union(self, x, y):
         x = self.find(x)
         y = self.find(y)
@@ -62,14 +62,14 @@ class UnionFind:
             if self.rank[x] == self.rank[y]:
                 self.rank[y] += 1
 
-
+    
     def get_component(self, x):
         component = []
         x = self.find(x)
         for y in range(self.n):
             z = self.find(y)
             if z == x:
-                component.append(y)
+                component.append(y) 
         return component
 
 
@@ -86,13 +86,16 @@ class BoundaryMatrix:
         if j not in self.columns.keys():
             self.columns[j] = [-i]
             return
-
+        
         if -i not in self.columns[j]:
             heapq.heappush(self.columns[j], -i)
             return
 
-
+    
     def add_column(self, i, j):
+        #self.columns[j] = list(heapq.merge(self.columns[j],self.columns[i]))
+        #self.columns[j].extend(self.columns[i])
+        #heapq.heapify(self.columns[j])
         heapq.heappop(self.columns[j])
         for item in self.columns[i][1:]:
             if item == self.columns[j][0]:
@@ -100,7 +103,7 @@ class BoundaryMatrix:
             else:
                 heapq.heappush(self.columns[j], item)
         return
-
+        
 
     def get_pivot(self, j):
         if j not in self.columns.keys():
@@ -139,22 +142,22 @@ class BoundaryMatrix:
                     self.pivots[pivot] = column
                     if clearing == True and dim != 1:
                         self.columns.pop(pivot)
-                        self.columns_to_reduce[dim-1].remove(pivot)
+                        self.columns_to_reduce[dim-1].remove(pivot)    
                 else:
                     self.columns.pop(column)
         self.reduced = True
         return
 
-
-    def get_Pairings(self):
-        return list(zip(self.pivots.keys(), self.pivots.values()))
+    
+    def get_Pairings(self):      
+        return list(zip(self.pivots.keys(), self.pivots.values())) 
 
 
     def get_column(self, j):
         column = []
         if j not in self.columns.keys():
             return column
-
+        
         column_heap = copy.deepcopy(self.columns[j])
         while(len(column_heap) != 0):
             pivot = -heapq.heappop(column_heap)
@@ -166,14 +169,14 @@ class BoundaryMatrix:
                 column.append(pivot)
         return column
 
-
+        
 
 class CubicalPersistence:
     def __init__(self, Picture, relative=False, reduced=False, filtration='sublevel', construction='V', valid='positive', get_image_columns_to_reduce=False, get_critical_edges=False, training=False):
         self.reduced = reduced
         assert filtration in ['sublevel','superlevel']
         self.filtration = filtration
-        assert construction in ['V','T']
+        assert construction in ['V','T']       
         self.construction = construction
         assert valid in ['all','nonnegative','positive']
         self.valid = valid
@@ -233,8 +236,8 @@ class CubicalPersistence:
         self.columns_to_reduce = [[],[],[]]
         self.set_CubeMap()
         self.compute_persistence(valid=valid)
-
-
+ 
+        
     def set_CubeMap(self):
         if type(self.PixelMap) == torch.Tensor:
             if self.filtration == 'sublevel':
@@ -261,7 +264,7 @@ class CubicalPersistence:
                                     self.IndexMap[2*i+k,2*j+l] = counter
                                     self.coordinates[counter] = (2*i+k,2*j+l)
                                     counter = int(counter-1)
-                for i,j in zip(argmax[0],argmax[1]):
+                for i,j in zip(argmax[0],argmax[1]):  
                     for k in [-1,1]:
                         if 2*i+k >=0 and 2*i+k <= self.M-1:
                             if self.IndexMap[2*i+k,2*j] == -1:
@@ -283,8 +286,8 @@ class CubicalPersistence:
                     self.ValueMap[2*i,2*j] = self.PixelMap[i,j]
                     self.IndexMap[2*i,2*j] = counter
                     self.coordinates[counter] = (2*i,2*j)
-                    counter = int(counter-1)
-                    PixelMap[i,j] = -np.inf
+                    counter = int(counter-1)                
+                    PixelMap[i,j] = -np.inf  
                 max = np.max(PixelMap)
         else:
             counter = int(0)
@@ -300,7 +303,7 @@ class CubicalPersistence:
                                 self.IndexMap[2*i+1+k,2*j+1+l] = counter
                                 self.coordinates[counter] = (2*i+1+k,2*j+1+l)
                                 counter = int(counter+1)
-                for i,j in zip(argmin[0],argmin[1]):
+                for i,j in zip(argmin[0],argmin[1]):   
                     for k in [-1,1]:
                         if self.IndexMap[2*i+1+k,2*j+1] == -1:
                             self.ValueMap[2*i+1+k,2*j+1] = self.PixelMap[i,j]
@@ -315,13 +318,13 @@ class CubicalPersistence:
                             self.coordinates[counter] = (2*i+1,2*j+1+k)
                             self.edges[counter_edges] = counter
                             counter = int(counter+1)
-                            counter_edges = int(counter_edges+1)
+                            counter_edges = int(counter_edges+1)    
                 for i,j in zip(argmin[0],argmin[1]):
                     self.ValueMap[2*i+1,2*j+1] = self.PixelMap[i,j]
                     self.IndexMap[2*i+1,2*j+1] = counter
                     self.coordinates[counter] = (2*i+1,2*j+1)
-                    counter = int(counter+1)
-                    PixelMap[i,j] = np.inf
+                    counter = int(counter+1)                                    
+                    PixelMap[i,j] = np.inf  
                 min = np.min(PixelMap)
 
 
@@ -332,11 +335,11 @@ class CubicalPersistence:
     def index_to_dim(self, idx):
         i,j = self.index_to_coordinates(idx)
         if i%2 == 0 and j%2 == 0:
-            dim = 0
+            dim = 0 
         elif i%2+j%2 == 1:
-            dim = 1
+            dim = 1  
         else:
-            dim = 2
+            dim = 2      
         return dim
 
 
@@ -344,7 +347,7 @@ class CubicalPersistence:
         if idx == np.inf:
             if self.filtration == 'sublevel':
                 return np.inf
-
+                
             else:
                 return -np.inf
 
@@ -359,7 +362,7 @@ class CubicalPersistence:
     def valid_interval(self, interval, valid='positive'):
         if valid in ['all','nonnegative']:
             return True
-
+        
         else:
             if self.filtration == 'sublevel':
                 return self.index_to_value(interval[0]) < self.index_to_value(interval[1])
@@ -377,7 +380,7 @@ class CubicalPersistence:
             boundary.extend([self.IndexMap[x,y-1],self.IndexMap[x,y+1]])
         return boundary
 
-
+    
     def get_dual_boundary(self, idx):
         boundary = []
         x,y = self.index_to_coordinates(idx)
@@ -396,7 +399,7 @@ class CubicalPersistence:
             else:
                 boundary.extend([self.IndexMap[x,y-1],self.IndexMap[x,y+1]])
         return boundary
-
+            
 
     def compute_dim0(self, valid='positive'):
         if self.reduced == False:
@@ -416,10 +419,10 @@ class CubicalPersistence:
             UF.union(x,y)
         return
 
-
+    
     def compute_dim1(self, valid='positive'):
         if self.get_image_columns_to_reduce:
-            UF = UnionFind(self.num_cubes+1, dual=True)
+            UF = UnionFind(self.num_cubes+1, dual=True)    
             for edge in self.edges[::-1]:
                 boundary = self.get_dual_boundary(edge)
                 x = UF.find(boundary[0])
@@ -430,12 +433,12 @@ class CubicalPersistence:
                 birth = min(UF.get_birth(x), UF.get_birth(y))
                 self.columns_to_reduce[2].append(birth)
                 if self.valid_interval((edge,birth), valid=valid):
-                    self.intervals[1].append((edge,birth))
+                    self.intervals[1].append((edge,birth))       
                 UF.union(x,y)
             self.columns_to_reduce[1].reverse()
             self.columns_to_reduce[2].sort()
         elif self.get_critical_edges:
-            UF = UnionFind(self.num_cubes+1, dual=True)
+            UF = UnionFind(self.num_cubes+1, dual=True)    
             for edge in self.edges[::-1]:
                 boundary = self.get_dual_boundary(edge)
                 x = UF.find(boundary[0])
@@ -446,11 +449,11 @@ class CubicalPersistence:
                 self.critical_edges.append(edge)
                 birth = min(UF.get_birth(x), UF.get_birth(y))
                 if self.valid_interval((edge,birth), valid=valid):
-                    self.intervals[1].append((edge,birth))
+                    self.intervals[1].append((edge,birth))       
                 UF.union(x,y)
             self.columns_to_reduce[1].reverse()
         else:
-            UF = UnionFind(self.num_cubes+1, dual=True)
+            UF = UnionFind(self.num_cubes+1, dual=True)    
             for edge in self.edges[::-1]:
                 boundary = self.get_dual_boundary(edge)
                 x = UF.find(boundary[0])
@@ -460,7 +463,7 @@ class CubicalPersistence:
                     continue
                 birth = min(UF.get_birth(x), UF.get_birth(y))
                 if self.valid_interval((edge,birth), valid=valid):
-                    self.intervals[1].append((edge,birth))
+                    self.intervals[1].append((edge,birth))       
                 UF.union(x,y)
             self.columns_to_reduce[1].reverse()
         return
@@ -479,7 +482,7 @@ class CubicalPersistence:
         intervals = [[self.fine_to_coarse(interval) for interval in self.intervals[dim]] for dim in range(2)]
         return intervals
 
-
+    
     def get_Betti_numbers(self, threshold=0.5):
         betti = [0,0]
         for dim in [0,1]:
@@ -495,7 +498,7 @@ class CubicalPersistence:
                             betti[dim] += 1
         return betti
 
-
+    
     def get_generating_vertex(self, cube):
         boundary = [cube]
         while boundary != []:
@@ -543,22 +546,22 @@ class ImagePersistence:
                 idx_row = self.CP_0.IndexMap[i-1,j]
                 self.B.set_one(idx_row,idx_col)
         for idx_col in self.B.columns_to_reduce[2]:
-            i,j = self.CP_1.index_to_coordinates(idx_col)
+            i,j = self.CP_1.index_to_coordinates(idx_col)               
             idx_row = self.CP_0.IndexMap[i,j+1]
             self.B.set_one(idx_row,idx_col)
             idx_row = self.CP_0.IndexMap[i,j-1]
-            self.B.set_one(idx_row,idx_col)
+            self.B.set_one(idx_row,idx_col)               
             idx_row = self.CP_0.IndexMap[i+1,j]
             self.B.set_one(idx_row,idx_col)
             idx_row = self.CP_0.IndexMap[i-1,j]
-            self.B.set_one(idx_row,idx_col)
+            self.B.set_one(idx_row,idx_col)            
         return
 
 
     def fine_to_coarse(self, interval):
         return (self.CP_0.index_to_value(interval[0]),self.CP_1.index_to_value(interval[1]))
 
-
+    
     def valid_interval(self, interval, valid='all'):
         if valid == 'all':
             return True
@@ -576,7 +579,7 @@ class ImagePersistence:
 
             else:
                 return self.CP_0.index_to_value(interval[0]) > self.CP_1.index_to_value(interval[1])
-
+            
 
     def compute_persistence(self, valid='all'):
         self.B.reduce(clearing=False)
@@ -587,7 +590,7 @@ class ImagePersistence:
             self.intervals[0] = []
         for (i,j) in pairings:
             if self.valid_interval((i,j), valid=valid):
-                self.intervals[self.CP_0.index_to_dim(i)].append((i,j))
+                self.intervals[self.CP_0.index_to_dim(i)].append((i,j))                                             
         return
 
 
@@ -619,7 +622,7 @@ class ImagePersistence:
             else:
                 boundary.extend([self.CP_1.IndexMap[x,y-1],self.CP_1.IndexMap[x,y+1]])
         return boundary
-
+    
 
     def compute_dim0(self, valid='all'):
         self.intervals[0] = [(0,np.inf)]
@@ -700,7 +703,7 @@ class InducedMatching:
                     self.unmatched_0[dim].remove(match[0])
                     self.unmatched_1[dim].remove(match[2])
 
-
+    
     def get_matching(self):
         matched = [[(self.IP.CP_0.fine_to_coarse(match[0]), self.IP.CP_1.fine_to_coarse(match[2]))for match in self.matched[dim]]for dim in range(2)]
         unmatched_0 = [[self.IP.CP_0.fine_to_coarse(interval)for interval in self.unmatched_0[dim]]for dim in range(2)]
@@ -732,7 +735,7 @@ class BettiMatching:
                 else:
                     Picture_comp = np.maximum(Picture_0, Picture_1)
             self.CP_0 = CubicalPersistence(Picture_0, relative=relative, reduced=reduced, valid=valid, filtration=filtration, construction=construction, get_critical_edges=use_UnionFind_for_image, training=training)
-            self.CP_1 = CubicalPersistence(Picture_1, relative=relative, reduced=reduced, valid=valid, filtration=filtration, construction=construction, get_critical_edges=use_UnionFind_for_image, training=training)
+            self.CP_1 = CubicalPersistence(Picture_1, relative=relative, reduced=reduced, valid=valid, filtration=filtration, construction=construction, get_critical_edges=use_UnionFind_for_image, training=training)          
             self.CP_comp = CubicalPersistence(Picture_comp, relative=relative, reduced=reduced, valid=valid, filtration=filtration, construction=construction, get_image_columns_to_reduce=not use_UnionFind_for_image, training=training)
             self.IP_0 = ImagePersistence(self.CP_0, self.CP_comp, valid=valid_image, use_UnionFind=use_UnionFind_for_image)
             self.IP_1 = ImagePersistence(self.CP_1, self.CP_comp, valid=valid_image, use_UnionFind=use_UnionFind_for_image)
@@ -749,7 +752,7 @@ class BettiMatching:
                     Picture_comp = np.minimum(Picture_0, Picture_1)
             self.CP_comp = CubicalPersistence(Picture_comp, relative=relative, reduced=reduced, valid=valid, filtration=filtration, construction=construction, get_critical_edges=use_UnionFind_for_image, training=training)
             self.CP_0 = CubicalPersistence(Picture_0, relative=relative, reduced=reduced, valid=valid, filtration=filtration, construction=construction, get_image_columns_to_reduce=not use_UnionFind_for_image, training=training)
-            self.CP_1 = CubicalPersistence(Picture_1, relative=relative, reduced=reduced, valid=valid, filtration=filtration, construction=construction, get_image_columns_to_reduce=not use_UnionFind_for_image, training=training)
+            self.CP_1 = CubicalPersistence(Picture_1, relative=relative, reduced=reduced, valid=valid, filtration=filtration, construction=construction, get_image_columns_to_reduce=not use_UnionFind_for_image, training=training) 
             self.IP_0 = ImagePersistence(self.CP_comp, self.CP_0, valid=valid_image, use_UnionFind=use_UnionFind_for_image)
             self.IP_1 = ImagePersistence(self.CP_comp, self.CP_1, valid=valid_image, use_UnionFind=use_UnionFind_for_image)
         self.IM_0 = InducedMatching(self.IP_0)
@@ -762,7 +765,7 @@ class BettiMatching:
 
 
     def match(self):
-        matched_1 = copy.deepcopy(self.IM_1.matched)
+        matched_1 = copy.deepcopy(self.IM_1.matched)    
         if self.comparison == 'union':
             for dim in range(2):
                 for match_0 in self.IM_0.matched[dim]:
@@ -784,14 +787,14 @@ class BettiMatching:
                             self.unmatched_comp[dim].remove(match_0[0])
                             self.unmatched_1[dim].remove(match_1[2])
                             matched_1[dim].remove(match_1)
-                            break
+                            break              
         return
 
 
     def get_matching(self, refined=False):
         if refined:
             return copy.deepcopy(self.matched), copy.deepcopy(self.unmatched_0), copy.deepcopy(self.unmatched_1)
-
+            
         matched = [[(self.CP_0.fine_to_coarse(match[0]), self.CP_1.fine_to_coarse(match[2]))for match in self.matched[dim]]for dim in range(2)]
         unmatched_0 = [[self.CP_0.fine_to_coarse(interval)for interval in self.unmatched_0[dim]]for dim in range(2)]
         unmatched_1 = [[self.CP_1.fine_to_coarse(interval)for interval in self.unmatched_1[dim]]for dim in range(2)]

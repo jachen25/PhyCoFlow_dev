@@ -1,4 +1,5 @@
-"""Mutual-relatedness profiles.
+"""
+Mutual-relatedness profiles.
 
 This module turns a multi-field saliency stack into a *mutual-relatedness
 profile*: for every ordered-by-index field pair ``(i, j)``, every threshold
@@ -10,8 +11,11 @@ fraction of cross-field component pairs that stand in relation ``r``:
         ---------------------------------------------------------------
         sum_{A in C_i(a_i)} sum_{B in C_j(a_j)} w(A) w(B)
 
-The profile for a pair has shape ``[T_i, T_j, 8]`` and records the normalized
-cross-field relation distribution over threshold pairs.
+The profile for a pair is a tensor of shape ``[T_i, T_j, 8]`` (8 = RCC8
+relations).  It is a normalized, scale-free signature of how the salient
+regions of two fields are spatially arranged relative to each other across
+scales -- the cross-field coincidence structure a reconstruction should
+preserve.
 """
 
 from __future__ import annotations
@@ -36,7 +40,9 @@ from .rcc import (
 from .saliency import SaliencySpec, compute_saliency_stack
 
 
-# Component extraction and weights.
+# -----------------------------------------------------------------------------
+# Component extraction + weights
+# -----------------------------------------------------------------------------
 
 @dataclass
 class Component:
@@ -54,9 +60,9 @@ class Component:
 def _component_weight(area: int, mode: str) -> float:
     """Map a component area to its profile weight ``w(A)``.
 
-    - ``area``: area-weighted components.
-    - ``sqrt_area``: square-root area weighting.
-    - ``uniform``: equal component weights.
+    - ``area``      : larger regions dominate the profile (mass-weighted).
+    - ``sqrt_area`` : softer, reduces dominance of one huge blob (default).
+    - ``uniform``   : every component counts equally (topology-only).
     The ``persistence_proxy`` mode is handled at the field level (it needs the
     threshold sweep) -- see :func:`extract_components_multiscale`.
     """
@@ -105,7 +111,8 @@ def extract_components(
         bbox = objects[lab - 1]
         if bbox is None:
             continue
-        # Materialize full-frame masks only after the minimum-area filter.
+        # Count within the bbox only; build the full-frame mask lazily after
+        # the min_area filter so discarded specks never materialize a frame.
         sub = labels[bbox] == lab
         area = int(sub.sum())
         if area < min_area:
@@ -135,8 +142,8 @@ def select_thresholds(
             thresholds violate this when the saliency distribution has a large
             atom (ties) — e.g. a constant background occupying most of the
             frame makes every 0.7-0.95 quantile equal to the background value
-            and the mask covers the whole frame. Thresholds are raised to the
-            smallest saliency value
+            and the mask sweep in the whole frame, so no structure is ever
+            isolated.  Thresholds are raised to the smallest saliency value
             satisfying the coverage bound.
         dedupe: drop duplicate threshold levels (ties produce identical,
             redundant profile rows that double-count one regime).
@@ -168,7 +175,9 @@ def select_thresholds(
     return th
 
 
-# Labeled-field representation for the vectorized profile path.
+# -----------------------------------------------------------------------------
+# Labeled-field representation (vectorized profile hot path)
+# -----------------------------------------------------------------------------
 
 @dataclass
 class _LabeledField:
@@ -458,7 +467,9 @@ def _pair_mu_labeled(
     return out
 
 
-# Profile container.
+# -----------------------------------------------------------------------------
+# Profile container
+# -----------------------------------------------------------------------------
 
 @dataclass
 class CoherenceProfile:

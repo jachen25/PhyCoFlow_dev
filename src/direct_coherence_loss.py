@@ -13,7 +13,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-# Topology classes are imported on demand.
+# Lazy topology imports.
 
 DifferentiableTopologicalCoherenceLoss = None  # populated by _import_topo()
 TopoLossConfig = None                           # populated by _import_topo()
@@ -21,7 +21,7 @@ _TOPO_IMPORTED = False
 
 
 def _import_topo() -> None:
-    """Load the topology loss classes once."""
+    """Import ``DifferentiableTopologicalCoherenceLoss`` / ``TopoLossConfig`` once."""
     global _TOPO_IMPORTED, DifferentiableTopologicalCoherenceLoss, TopoLossConfig
     if _TOPO_IMPORTED:
         return
@@ -42,7 +42,7 @@ def _import_topo() -> None:
     _TOPO_IMPORTED = True
 
 
-# Configuration.
+# Config
 
 def _accept_retired_kwargs(cls):
     """Map retired config names to their current equivalents."""
@@ -146,6 +146,8 @@ class TopoDirectCoherenceConfig:
     dice_weight: float = 1.0
     cldice_weight: float = 1.0
     cross_dice_weight: float = 0.5
+    superlevel_level_mode: str = "reference_quantile"
+    superlevel_physical_levels: tuple = ()
     # clDice mask sharpness; None uses superlevel_sharpness.
     skeleton_sharpness: Optional[float] = 16.0
     skeleton_iters: int = 6
@@ -186,6 +188,8 @@ class TopoDirectCoherenceConfig:
     # Independently weighted self/mutual H0/H1 cells.
     self_h0_weight: float = 1.0
     self_h1_weight: float = 1.0
+    self_persistence_h0_weight: float = 0.0
+    self_persistence_h1_weight: float = 0.0
     mutual_h0_weight: float = 1.0
     mutual_h1_weight: float = 1.0
     self_h0_create_weight: float = 0.0
@@ -203,6 +207,11 @@ class TopoDirectCoherenceConfig:
     output_mutual_h0_weight: float = 0.0
     output_mutual_h1_weight: float = 0.0
     output_mutual_spatial_weight: float = 0.0
+    output_mutual_persistence_h0_weight: float = 0.0
+    output_mutual_persistence_h1_weight: float = 0.0
+    output_mutual_curve_loss: str = "mse"
+    persistence_train_batch_size: int = 0
+    persistence_eval_batch_size: int = 0
     # Matching backend + spatially-lifted cost (SATLoss / geometric lifting).
     matching_backend: str = "induced"
     lambda_spatial_self: float = 0.0
@@ -245,7 +254,7 @@ class TopoDirectCoherenceConfig:
         return asdict(self)
 
     def to_topo_loss_config(self):
-        """Build the underlying ``TopoLossConfig``."""
+        """Build the underlying ``TopoLossConfig`` (importing the topo stack lazily)."""
         _import_topo()
         return TopoLossConfig(
             grid_h=int(self.grid_h),
@@ -305,6 +314,9 @@ class TopoDirectCoherenceConfig:
             dice_weight=float(self.dice_weight),
             cldice_weight=float(self.cldice_weight),
             cross_dice_weight=float(self.cross_dice_weight),
+            superlevel_level_mode=str(self.superlevel_level_mode),
+            superlevel_physical_levels=tuple(
+                float(v) for v in self.superlevel_physical_levels),
             skeleton_sharpness=(float(self.skeleton_sharpness) if self.skeleton_sharpness is not None else None),
             skeleton_iters=int(self.skeleton_iters),
             # Two-parameter filtration mode.
@@ -339,6 +351,8 @@ class TopoDirectCoherenceConfig:
             # Self and mutual H0/H1 terms.
             self_h0_weight=float(self.self_h0_weight),
             self_h1_weight=float(self.self_h1_weight),
+            self_persistence_h0_weight=float(self.self_persistence_h0_weight),
+            self_persistence_h1_weight=float(self.self_persistence_h1_weight),
             mutual_h0_weight=float(self.mutual_h0_weight),
             mutual_h1_weight=float(self.mutual_h1_weight),
             self_h0_create_weight=float(self.self_h0_create_weight),
@@ -356,6 +370,13 @@ class TopoDirectCoherenceConfig:
             output_mutual_h0_weight=float(self.output_mutual_h0_weight),
             output_mutual_h1_weight=float(self.output_mutual_h1_weight),
             output_mutual_spatial_weight=float(self.output_mutual_spatial_weight),
+            output_mutual_persistence_h0_weight=float(
+                self.output_mutual_persistence_h0_weight),
+            output_mutual_persistence_h1_weight=float(
+                self.output_mutual_persistence_h1_weight),
+            output_mutual_curve_loss=str(self.output_mutual_curve_loss),
+            persistence_train_batch_size=int(self.persistence_train_batch_size),
+            persistence_eval_batch_size=int(self.persistence_eval_batch_size),
             matching_backend=str(self.matching_backend),
             lambda_spatial_self=float(self.lambda_spatial_self),
             lambda_spatial_mutual=float(self.lambda_spatial_mutual),
@@ -534,18 +555,43 @@ def data_and_anchor_losses(
     obs_field_ids: torch.Tensor,
     params: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Return RF data loss and velocity drift from a frozen base model.
+    """Rectified-flow data loss plus a function-space anchor to the frozen base.
 
-    Both terms use the same source sample, time, state, and conditioning. The
-    base forward runs in evaluation mode without gradient tracking.
+    The anchor is E||v_theta(x_t, t) - v_base(x_t, t)||^2 on the same (t, x0,
+    x_t, conditioning) draw as the data loss, so the two losses see identical
+    inputs and the extra cost is one frozen forward pass. Anchoring the learned
+    velocity field (L2-SP / RLHF-KL style; DRaFT uses LoRA for the same
+    purpose) bounds drift from the pretrained model directly, including drift
+    in the null space of the training loss, which no loss-budget constraint
+    can see.
+
+    The data loss is ``model.rf_terms`` — the SAME computation as
+    ``model.training_loss`` and deterministic validation, by construction —
+    so a data-only control consumes an identical RNG stream and measures an
+    identical quantity.
+
+    MODE CONGRUENCE (N20 root cause, 2026-08-19): the live forward runs in
+    eval mode -- differentiable, only dropout/jitter are disabled -- because
+    the topology objective's rollouts (``_eval_mode_velocity``) and every
+    deliverable metric (deterministic validation, Pareto selection,
+    deployment) measure the eval-mode function. When this pred was computed
+    with dropout active instead, the constrained problem became
+    min Topo(f_eval) s.t. Data(f_dropout) <= eps, Anchor(f_dropout) <= eps:
+    the duals watched a different function from the one the objective was
+    moving, and the optimizer destroyed the deployed model (val RF 0.52 ->
+    17) while both budgets read as satisfied (measured: dropout-mode RF 0.20
+    vs eval-mode RF 7.45 on the SAME train batches). The eval-mode forward
+    also removes the dropout noise floor from the anchor, so it is exactly 0
+    at model == base, as the dual initialisation assumes.
     """
-    x0 = model.sample_source(coords)
-    bsz = x1.shape[0]
-    t = torch.rand(bsz, device=x1.device, dtype=x1.dtype)
-    x_t = model.simulate(t, x0, x1)
-    target = model.target_vector_field(x0, x1)
-    pred = model.model(t, x_t, coords, obs_coords, obs_values, obs_mask,
-                       obs_field_ids, **({} if params is None else {"params": params}))
+    was_training = model.training
+    model.eval()
+    try:
+        t, x_t, target, pred = model.rf_terms(
+            x1, coords, obs_coords, obs_values, obs_mask, obs_field_ids,
+            params=params)
+    finally:
+        model.train(was_training)
     data_loss = F.mse_loss(pred, target)
     with torch.no_grad():
         base_pred = _eval_mode_velocity(
@@ -610,8 +656,12 @@ def clean_estimate_rollout(
 ) -> torch.Tensor:
     """Differentiable Euler/Heun rollout with optional hard sensor clamping.
 
-    ``backprop_last_k`` limits autograd to the final solver steps. ``None`` or
-    a nonpositive value retains full-rollout backpropagation.
+    ``backprop_last_k`` truncates the gradient to the last K solver steps
+    (DRaFT-K, Clark et al., 2024): earlier steps run under no_grad. Backprop
+    through a fully unrolled solve is known to produce exploding or chaotic
+    gradients ("Gradients are Not All You Need", Metz et al., 2021), and
+    truncation bounds that amplification without changing the forward rollout.
+    None or <= 0 keeps full-depth backprop.
     """
     if getattr(model, "requires_full_grid", False):
         raise NotImplementedError(
@@ -658,7 +708,7 @@ def clean_estimate_rollout(
                 raise ValueError(
                     "obs_indices do not identify obs_coords on the rollout query set")
     bsz = coords.shape[0]
-    # Preserve caller RNG state during seeded source sampling.
+    # Isolate seeded source sampling from the caller's RNG state.
     if source_seed is not None:
         cpu_state = torch.get_rng_state()
         cuda_state = (torch.cuda.get_rng_state_all()
@@ -673,7 +723,7 @@ def clean_estimate_rollout(
     else:
         x = model.sample_source(coords)
     ts = torch.linspace(0.0, 1.0, int(n_steps) + 1, device=coords.device, dtype=coords.dtype)
-    # Checkpoint sufficiently long differentiable rollouts.
+    # Checkpoint long rollouts to reduce activation memory.
     k = int(backprop_last_k) if backprop_last_k is not None else 0
     if k < 0:
         raise ValueError(f"backprop_last_k must be None or >= 0, got {backprop_last_k}")
@@ -711,6 +761,118 @@ def clean_estimate_rollout(
         x = scatter_observed_values(
             x, obs_values, obs_mask, obs_indices, obs_field_ids, strength=1.0)
     return x
+
+
+def clean_estimate_random_rollout_step(
+    model: nn.Module,
+    x1: torch.Tensor,
+    coords: torch.Tensor,
+    obs_coords: torch.Tensor,
+    obs_values: torch.Tensor,
+    obs_mask: torch.Tensor,
+    obs_field_ids: torch.Tensor,
+    obs_indices: Optional[torch.Tensor] = None,
+    n_steps: int = 8,
+    source_seed: Optional[int] = None,
+    ode_solver: str = "euler",
+    obs_consistency_mode: str = "none",
+    params: Optional[torch.Tensor] = None,
+    step_index: Optional[int] = None,
+    use_checkpoint: bool = True,
+) -> torch.Tensor:
+    """Return a one-step endpoint estimate from a random rollout state.
+
+    The state before the selected solver step is generated without gradients,
+    then one velocity evaluation predicts the clean endpoint as
+    ``x_t + (1-t) v_theta(x_t,t)``.  This is the flow-matching analogue of the
+    randomized single-step ReFL estimator: every trajectory time receives
+    credit across updates without backpropagating through the whole ODE solve.
+    """
+    if getattr(model, "requires_full_grid", False):
+        raise NotImplementedError(
+            "Random-step topology post-training currently supports point-cloud backbones.")
+    steps = int(n_steps)
+    if steps < 1:
+        raise ValueError(f"n_steps must be >= 1, got {n_steps}")
+    solver = str(ode_solver)
+    if solver not in ("euler", "heun"):
+        raise NotImplementedError(
+            f"clean_estimate_random_rollout_step: ode_solver={solver!r} is not implemented")
+    consistency = str(obs_consistency_mode)
+    if consistency not in ("none", "default_hard"):
+        raise NotImplementedError(
+            "clean_estimate_random_rollout_step supports obs_consistency_mode "
+            "'none' or 'default_hard'")
+    if consistency == "default_hard" and obs_indices is None:
+        raise ValueError("default_hard requires obs_indices on the rollout query set")
+
+    # Keep source sampling and time selection repeatable without perturbing the
+    # data/control RNG stream owned by the caller.
+    if source_seed is not None:
+        cpu_state = torch.get_rng_state()
+        cuda_state = (torch.cuda.get_rng_state_all()
+                      if torch.cuda.is_available() else None)
+        torch.manual_seed(int(source_seed))
+        try:
+            x = model.sample_source(coords)
+        finally:
+            torch.set_rng_state(cpu_state)
+            if cuda_state is not None:
+                torch.cuda.set_rng_state_all(cuda_state)
+    else:
+        x = model.sample_source(coords)
+    if step_index is None:
+        step_gen = torch.Generator(device="cpu")
+        step_gen.manual_seed(int(source_seed or 0) + 7_919)
+        selected = int(torch.randint(steps, (), generator=step_gen))
+    else:
+        selected = int(step_index)
+    if selected < 0 or selected >= steps:
+        raise ValueError(f"step_index must be in [0,{steps}), got {selected}")
+
+    ts = torch.linspace(0.0, 1.0, steps + 1, device=coords.device, dtype=coords.dtype)
+    bsz = coords.shape[0]
+
+    def clamp_observations(value: torch.Tensor) -> torch.Tensor:
+        if consistency == "none":
+            return value
+        from obs_consistency import scatter_observed_values
+        return scatter_observed_values(
+            value, obs_values, obs_mask, obs_indices, obs_field_ids, strength=1.0)
+
+    # Reach the selected state with the deployed solver, but deliberately sever
+    # this prefix graph. The selected time itself remains differentiable.
+    with torch.no_grad():
+        for i in range(selected):
+            t0 = ts[i].expand(bsz)
+            dt = ts[i + 1] - ts[i]
+            v0 = _eval_mode_velocity(
+                model, t0, x, coords, obs_coords, obs_values, obs_mask,
+                obs_field_ids, params=params)
+            if solver == "heun":
+                x_pred = x + dt * v0
+                v1 = _eval_mode_velocity(
+                    model, ts[i + 1].expand(bsz), x_pred, coords, obs_coords,
+                    obs_values, obs_mask, obs_field_ids, params=params)
+                x = x + 0.5 * dt * (v0 + v1)
+            else:
+                x = x + dt * v0
+            x = clamp_observations(x)
+
+    t_selected = ts[selected].expand(bsz)
+    x = x.detach()
+    if bool(use_checkpoint) and torch.is_grad_enabled():
+        from torch.utils.checkpoint import checkpoint
+        velocity = checkpoint(
+            _eval_mode_velocity, model, t_selected, x, coords, obs_coords,
+            obs_values, obs_mask, obs_field_ids,
+            use_reentrant=False, params=params)
+    else:
+        velocity = _eval_mode_velocity(
+            model, t_selected, x, coords, obs_coords, obs_values, obs_mask,
+            obs_field_ids, params=params)
+    endpoint = x + (1.0 - t_selected).view(-1, 1, 1) * velocity
+    return clamp_observations(endpoint)
 
 
 # Two-objective gradient balancing.
@@ -843,7 +1005,7 @@ def apply_two_objective_update(
 # Gradient sanity check.
 
 def gradient_sanity_check(device: str | torch.device = "cpu") -> bool:
-    """Return whether the topology loss propagates a finite input gradient."""
+    """Small check that the topological loss backpropagates to the input field."""
     _import_topo()
     rng = np.random.default_rng(0)
     coords_xy = rng.random((256, 2))

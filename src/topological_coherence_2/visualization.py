@@ -1,4 +1,20 @@
-"""File-based visualizations for topological coherence diagnostics."""
+"""
+Visualizations for topological coherence diagnostics.
+
+Four views:
+
+1. :func:`plot_relation_heatmap`     -- how often one RCC relation occurs across
+                                        the (alpha_i, alpha_j) threshold grid.
+2. :func:`plot_topological_error_map`-- where (in threshold space) the predicted
+                                        relations diverge from the reference.
+3. :func:`plot_rcc_graph`            -- the region graph at one threshold:
+                                        nodes = components, edges = RCC relations.
+4. :func:`plot_component_overlay`    -- the thresholded regions on the domain,
+                                        for a visual check of the relations.
+
+All functions accept a ``path`` and save a PNG; they never show interactively
+(safe for headless / cluster use).
+"""
 
 from __future__ import annotations
 
@@ -74,7 +90,11 @@ def plot_topological_error_map(
     divergence: str = "js",
     title: Optional[str] = None,
 ) -> None:
-    """Plot prediction-reference divergence over threshold space."""
+    """Heatmap of the pred-vs-ref categorical divergence over threshold space.
+
+    Bright cells = threshold regimes where the reconstruction got the
+    cross-field relations most wrong.
+    """
     i, j = field_pair
     fig, ax = plt.subplots(figsize=(5.2, 4.4))
     im = ax.imshow(error_map, origin="lower", aspect="auto", cmap="magma",
@@ -109,7 +129,8 @@ def build_rcc_graph(
 
     Returns a tuple ``(nodes, edges)`` where ``nodes`` is a list of dicts
     ``{id, field, area, weight, centroid}`` and ``edges`` is a list of dicts
-    ``{u, v, relation}``. The returned representation is backend-independent.
+    ``{u, v, relation}``.  Kept backend-agnostic so it works with or without
+    networkx.
     """
     rcc_cfg = rcc_cfg or RCCConfig()
     s = compute_saliency_stack(u, saliency)
@@ -177,7 +198,7 @@ def plot_rcc_graph(
         drop_dc=drop_dc,
     )
     if not nodes:
-        # Emit a placeholder for an empty component set.
+        # Nothing to draw; emit an explicit placeholder rather than failing.
         fig, ax = plt.subplots(figsize=(6, 5))
         ax.text(0.5, 0.5, "no components at selected thresholds", ha="center", va="center")
         ax.set_axis_off()
@@ -186,9 +207,11 @@ def plot_rcc_graph(
         return
 
     cmap = plt.get_cmap("tab10")
-    # Centroids are (row, column); plot column as x and inverted row as y.
+    # centroid is (row, col) = (y, x); plot x=col, y=row(inverted for image-like)
     pos = {n["id"]: [float(n["centroid"][-1]), float(n["centroid"][-2])] for n in nodes}
-    # Offset shared centroids so nodes and zero-length edges remain visible.
+    # Nudge components that share a centroid (e.g. concentric blobs) so their
+    # nodes and the edge between them are visible -- and so networkx's edge-label
+    # renderer never sees a degenerate zero-length edge.
     seen_pos: Dict[Tuple[int, int], int] = {}
     for nid, (px, py) in list(pos.items()):
         key = (int(round(px)), int(round(py)))
@@ -214,7 +237,8 @@ def plot_rcc_graph(
         nx.draw_networkx_edges(g, pos, ax=ax, alpha=0.4, width=1.2)
         nx.draw_networkx_nodes(g, pos, ax=ax, node_size=sizes, node_color=colors,
                                edgecolors="k", linewidths=0.5)
-        # Place labels manually because CurvedArrowText fails on near-degenerate edges.
+        # Manual edge labels: networkx's CurvedArrowText renderer crashes on
+        # near-degenerate edges, so place the relation text at each midpoint.
         for e in edges:
             mx = 0.5 * (pos[e["u"]][0] + pos[e["v"]][0])
             my = 0.5 * (pos[e["u"]][1] + pos[e["v"]][1])
@@ -262,7 +286,9 @@ def plot_component_overlay(
 ) -> None:
     """Overlay thresholded region masks of selected channels on the domain.
 
-    Each selected channel's super-level set is a translucent 2D layer.
+    Each selected channel's super-level set is drawn as a translucent coloured
+    layer (2D only). Useful for visually confirming an RCC relation, e.g. that
+    the CO blob sits inside the T blob.
     """
     if u.ndim != 3:
         raise ValueError("plot_component_overlay currently supports 2D fields ([C,H,W]).")
@@ -270,7 +296,7 @@ def plot_component_overlay(
     cmap = plt.get_cmap("tab10")
 
     fig, ax = plt.subplots(figsize=(7, 6))
-    # Mean-saliency backdrop for spatial context.
+    # Grey backdrop: mean saliency, for spatial context.
     ax.imshow(s[list(field_indices)].mean(axis=0), origin="lower", cmap="gray", alpha=0.6)
     for k, ci in enumerate(field_indices):
         if ci not in selected_thresholds:

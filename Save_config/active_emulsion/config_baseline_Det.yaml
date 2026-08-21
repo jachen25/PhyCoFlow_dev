@@ -1,0 +1,126 @@
+# =============================================================================
+# Unified Deterministic Baseline Configuration -- ACTIVE EMULSION (joint SR)
+# -----------------------------------------------------------------------------
+# Required selectors:
+#   baseline_model : mlp_rbf | senseiver | geofno   (only senseiver configured)
+#   training_stage : 1
+#
+# Task: the N18/N19 joint super-resolution protocol. The model is conditioned
+# on mean-pooled coarse-grid observations of all three channels and must
+# reconstruct the full 128x128 fields:
+#   phi (0):  8x8 block means -> 16x16 = 256 tokens  (camera / block average)
+#   vx  (1): 16x16 block means ->  8x8 =  64 tokens  (PIV window average)
+#   vy  (2): 16x16 block means ->  8x8 =  64 tokens  (colocated with vx)
+# Pooling is done in RAW PHYSICAL units before the asinh flow transform
+# (obs_grid_pool_physical, matching FFM N19), because
+# mean(asinh(v)) != asinh(mean(v)). Pooled block means are sensor tokens only,
+# never valid pointwise targets, so no observation clamping exists on this
+# deterministic path.
+#
+# FAIRNESS NOTE: the FFM N19 run additionally conditions on the generating
+# parameters (H, R, m) via param_conditioning. The Senseiver architecture has
+# no parameter-injection path, so this baseline is parameter-blind: it must
+# infer the regime from the 384 pooled observations alone. Keep this asymmetry
+# in mind when reading the comparison.
+# =============================================================================
+
+baseline_model: "senseiver"
+training_stage: 1
+
+shared:
+  # DemoN19: matched to the FFM N19 joint-SR base
+  # (config_pointcloud_ffm_N19_joint_sr_dense.yaml).
+  demo_num: 19
+  seed: 42
+  device_ids: [0]
+  reload: false
+
+  paths:
+    data_path: "/home/jachen25/orcd/pool/active_emulsion_dataset/data_half_885"
+    save_root: "Save_TrainedModel/active_emulsion"
+    config_backup_root: "Save_config/active_emulsion/det_baseline"
+
+  data:
+    dataset_name: "active_emulsion"
+    # train_ratio/time_stride are unused: active_emulsion uses cell-level
+    # splits.json protocols (each (H, R, m) cell lives in one partition).
+    train_ratio: 0.8
+    time_stride: 1
+    num_workers: 12
+    num_x: 128
+    num_y: 128
+    # ActiveEmulsionDataset kwargs, mirroring FFM N19 exactly.
+    ae_protocol: "interp"
+    ae_fields: ["phi", "vx", "vy"]
+    ae_flow_transform: "asinh"
+    # Train-only frame thinning + exact torus augmentation (val is full/clean).
+    ae_frame_downsample: true
+    ae_frame_tau: 0.02
+    ae_frame_min: 4
+    ae_augment: "translate_rot90"
+
+  conditioning:
+    # Field IDs index ae_fields: 0: phi, 1: vx, 2: vy.
+    # The n_obs bounds are ignored for strided fields but must be present and
+    # length-matched (256 = 16x16 pooled phi sites, 64 = 8x8 pooled vx/vy).
+    cond_fields: [0, 1, 2]
+    n_obs_min_list: [256, 64, 64]
+    n_obs_max_list: [256, 64, 64]
+    obs_grid_stride_list: [8, 16, 16]
+    obs_grid_pool: true
+    obs_grid_pool_physical: true
+    vis_cond_fields: [0, 1, 2]
+    vis_n_obs_list: [256, 64, 64]
+
+  logging:
+    eval_every: 5
+    save_every: 200
+
+  # Optional global training overrides; null keeps the per-model values below.
+  overrides:
+    epochs:
+    batch_size:
+    learning_rate:
+    weight_decay:
+
+senseiver_params:
+  training:
+    epochs: 10000
+    # Match the FFM N19 effective batch (64) and lr (1.0e-4); weight decay
+    # follows the Det-baseline convention (1e-6) used on elasticity/airfoil.
+    batch_size: 64
+    grad_accum_steps: 1
+    learning_rate: 1.0e-4
+    weight_decay: 1.0e-6
+    eval_every: 5
+    save_every: 200
+    # Match the FFM N19 query subsample (2048 of the 16384 grid points).
+    n_query_points: 2048
+
+  architecture:
+    # Capacity-matched to the GL_rbf_ENH pointcloud-FFM N19 joint-SR run
+    # (config_pointcloud_ffm_N19_joint_sr_dense.yaml): D=256, N=4, H=8,
+    # L=128, FF=4.
+    #   D (latent_dim)          = 256
+    #   N (latent depth)        = 4 -> num_encoder_layers(2) x num_self_attn_per_block(2)
+    #   H (attn heads)          = 8 (256 % 8 == 0; head_dim = 32)
+    #   L (num_latents)         = 128
+    #   FF (ff_mult)            = 4
+    # space_bands/max_freq = 32/64 match the FFM's Fourier featurization
+    # (pe_num_bands=32, pe_max_freq=64, sized for the 128x128 grid).
+    # field_embed_dim = D/8 = 32 follows the elasticity(8@D=64)/airfoil
+    # (16@D=128) scaling convention. dropout = 0.1 matches N19's own
+    # attn/mlp dropout (prior baselines used 0.0 because their FFMs did).
+    coord_dim: 2
+    num_latents: 128
+    latent_dim: 256
+    num_encoder_layers: 2
+    num_self_attn_per_block: 2
+    num_cross_attn_heads: 8
+    num_self_attn_heads: 8
+    dec_num_cross_attn_heads: 8
+    field_embed_dim: 32
+    space_bands: 32
+    max_freq: 64.0
+    ff_mult: 4
+    dropout: 0.1

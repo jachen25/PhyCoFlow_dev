@@ -19,7 +19,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-# Add ``src`` for direct module execution.
+# Make sibling modules importable outside ``src``.
 _SRC_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _SRC_DIR not in sys.path:
     sys.path.insert(0, _SRC_DIR)
@@ -38,7 +38,7 @@ from topological_coherence_2.diff_persistence import (
 RCC8_RELATIONS: Tuple[str, ...] = ("DC", "EC", "PO", "EQ", "TPP", "NTPP", "TPPi", "NTPPi")
 
 
-# Configuration.
+# Config
 
 # Re-export the dependency-free mode registry.
 from topo_modes import (            # noqa: F401
@@ -145,6 +145,8 @@ class TopoLossConfig:
     cldice_weight: float = 1.0
     cross_dice_weight: float = 0.5
     skeleton_iters: int = 6
+    superlevel_level_mode: str = "reference_quantile"
+    superlevel_physical_levels: tuple = ()
 
     # Two-parameter filtration matching.
     bifilt_carrier_channel: int = 0
@@ -179,9 +181,12 @@ class TopoLossConfig:
     betti_match_saliency: str = "zscore"
     bar_normalize: str = "gt_bars"
 
-    # Matching backend and spatial cost. ``induced`` uses Stucki registration
-    # with squared-L2 bar cost. ``lifted`` uses optimal partial matching with
-    # L1 bar cost and optional spatial lifting. Cost scales differ by backend.
+    # Matching backend. 'induced' = Stucki registration (squared-L2 bar cost);
+    # 'lifted' = optimal partial matching with the creator-position cost
+    # (L1 + lambda * spatial distance; multiplicative=SATLoss, additive=Soler
+    # geometric lifting). lambda=0 lifted is the literal plain-Wasserstein
+    # ablation. Backends have different cost scales: calibrate lambda by
+    # sweeping per backend and per cell, never by transferring a number.
     matching_backend: str = "induced"
     lambda_spatial_self: float = 0.0
     lambda_spatial_mutual: float = 0.0
@@ -191,6 +196,8 @@ class TopoLossConfig:
     # Independently weighted self/mutual H0/H1 terms.
     self_h0_weight: float = 1.0
     self_h1_weight: float = 1.0
+    self_persistence_h0_weight: float = 0.0
+    self_persistence_h1_weight: float = 0.0
     mutual_h0_weight: float = 1.0
     mutual_h1_weight: float = 1.0
     self_h0_create_weight: float = 0.0
@@ -231,6 +238,13 @@ class TopoLossConfig:
     output_mutual_h0_weight: float = 0.0
     output_mutual_h1_weight: float = 0.0
     output_mutual_spatial_weight: float = 0.0
+    output_mutual_persistence_h0_weight: float = 0.0
+    output_mutual_persistence_h1_weight: float = 0.0
+    output_mutual_curve_loss: str = "mse"
+    # Exact barcode matching is CPU-bound. Zero uses the full comprehensive
+    # batch; positive values rotate through batch positions across calls.
+    persistence_train_batch_size: int = 0
+    persistence_eval_batch_size: int = 0
 
     # Gradient-EMA balancing among active weighted components.
     component_balance_enabled: bool = False
@@ -248,7 +262,8 @@ class TopoLossConfig:
             raise ValueError(
                 "mode 'euler_curve' (old name 'defect') is retired: chi = b0 - b1 "
                 "conflates homology dimensions and the measured defect is "
-                "H1-specific. Use mode 'betti_self_mutual'.")
+                "H1-specific. Use mode 'betti_self_mutual'. The retired "
+                "implementation is archived in backup_topo_preunify_*.tar.gz.")
         _valid_sal = ("abs", "zscore", "zscore_abs", "zscore_pos", "zscore_neg", "raw", "pos", "neg")
         sal_vals = (self.saliency.values() if isinstance(self.saliency, dict)
                     else (self.saliency,))
@@ -275,6 +290,16 @@ class TopoLossConfig:
                     "marginal_level_mode='physical' requires finite "
                     "marginal_physical_levels")
             self.marginal_physical_levels = levels
+        if str(self.superlevel_level_mode) not in ("reference_quantile", "physical"):
+            raise ValueError(
+                "superlevel_level_mode must be 'reference_quantile' or 'physical'")
+        if str(self.superlevel_level_mode) == "physical":
+            levels = tuple(float(v) for v in self.superlevel_physical_levels)
+            if not levels or not all(np.isfinite(v) for v in levels):
+                raise ValueError(
+                    "superlevel_level_mode='physical' requires finite "
+                    "superlevel_physical_levels")
+            self.superlevel_physical_levels = levels
         if float(self.marginal_variance_weight) < 0.0:
             raise ValueError("marginal_variance_weight must be non-negative")
         if (float(self.marginal_variance_weight) > 0.0
@@ -284,6 +309,8 @@ class TopoLossConfig:
         _nonnegative = {
             "self_h0_weight": self.self_h0_weight,
             "self_h1_weight": self.self_h1_weight,
+            "self_persistence_h0_weight": self.self_persistence_h0_weight,
+            "self_persistence_h1_weight": self.self_persistence_h1_weight,
             "mutual_h0_weight": self.mutual_h0_weight,
             "mutual_h1_weight": self.mutual_h1_weight,
             "self_h0_create_weight": self.self_h0_create_weight,
@@ -294,9 +321,16 @@ class TopoLossConfig:
             "output_mutual_h0_weight": self.output_mutual_h0_weight,
             "output_mutual_h1_weight": self.output_mutual_h1_weight,
             "output_mutual_spatial_weight": self.output_mutual_spatial_weight,
+            "output_mutual_persistence_h0_weight": self.output_mutual_persistence_h0_weight,
+            "output_mutual_persistence_h1_weight": self.output_mutual_persistence_h1_weight,
         }
         if any(float(v) < 0.0 for v in _nonnegative.values()):
             raise ValueError(f"topology component weights must be non-negative: {_nonnegative}")
+        if str(self.output_mutual_curve_loss) not in ("mse", "nmae"):
+            raise ValueError("output_mutual_curve_loss must be 'mse' or 'nmae'")
+        if (int(self.persistence_train_batch_size) < 0
+                or int(self.persistence_eval_batch_size) < 0):
+            raise ValueError("persistence batch sizes must be non-negative")
         dims = tuple(int(v) for v in self.homology_dims)
         if not dims or any(v not in (0, 1) for v in dims) or len(set(dims)) != len(dims):
             raise ValueError("homology_dims must be a nonempty unique subset of (0, 1)")
@@ -310,9 +344,17 @@ class TopoLossConfig:
             raise ValueError("component balance scales require 0 < min_scale <= max_scale")
         if float(self.component_balance_eps) <= 0.0:
             raise ValueError("component_balance_eps must be positive")
-        if bool(self.component_balance_enabled) and self.mode != "betti_self_mutual":
+        if (bool(self.component_balance_enabled)
+                and self.mode not in ("betti_self_mutual", "comprehensive_self_mutual")):
             raise ValueError(
-                "component_balance_enabled currently requires mode='betti_self_mutual'")
+                "component_balance_enabled currently requires mode='betti_self_mutual' "
+                "or mode='comprehensive_self_mutual'")
+        if (any(float(value) > 0.0 for value in (
+                self.self_persistence_h0_weight,
+                self.self_persistence_h1_weight))
+                and self.mode != "comprehensive_self_mutual"):
+            raise ValueError(
+                "self persistence weights require mode='comprehensive_self_mutual'")
         if str(self.matching_backend) not in ("induced", "lifted"):
             raise ValueError(f"unknown matching_backend {self.matching_backend!r}; "
                              "valid: 'induced' | 'lifted'")
@@ -358,15 +400,21 @@ class TopoLossConfig:
             self.output_mutual_h0_weight,
             self.output_mutual_h1_weight,
             self.output_mutual_spatial_weight,
+            self.output_mutual_persistence_h0_weight,
+            self.output_mutual_persistence_h1_weight,
         ))
-        if output_mutual_on and (
-                self.mode != "betti_self_mutual" or str(self.target) != "marginal"):
+        output_mutual_context = (
+            (self.mode == "betti_self_mutual" and str(self.target) == "marginal")
+            or (self.mode == "comprehensive_self_mutual" and str(self.target) == "paired"))
+        if output_mutual_on and not output_mutual_context:
             raise ValueError(
-                "output-mutual coherence requires mode='betti_self_mutual' and target='marginal'")
-        if output_mutual_on and str(self.mutual_anchor_source) != "observed":
+                "output-mutual coherence requires betti_self_mutual/marginal or "
+                "comprehensive_self_mutual/paired")
+        if (output_mutual_on and self.mode == "betti_self_mutual"
+                and str(self.mutual_anchor_source) != "observed"):
             raise ValueError(
                 "output-mutual coherence reuses mutual_anchor_provider/channels and requires "
-                "mutual_anchor_source='observed'")
+                "mutual_anchor_source='observed' in the marginal unified mode")
         if output_mutual_on and str(self.mutual_carrier_gauge) == "symmetric_min":
             raise ValueError(
                 "output-mutual coherence does not support mutual_carrier_gauge='symmetric_min'; "
@@ -376,6 +424,38 @@ class TopoLossConfig:
             raise ValueError(
                 f"mutual_anchor_source='observed' is only defined for mode='betti_self_mutual', "
                 f"not {self.mode!r}.")
+        if self.mode == "comprehensive_self_mutual":
+            if str(self.target) != "paired":
+                raise ValueError("comprehensive_self_mutual requires target='paired'")
+            if str(self.mutual_anchor_source) != "generated":
+                raise ValueError(
+                    "comprehensive_self_mutual requires mutual_anchor_source='generated': "
+                    "both phi and derived vorticity must come from the generated output")
+            if not output_mutual_on:
+                raise ValueError(
+                    "comprehensive_self_mutual requires at least one generated-output mutual term")
+            from .mph_fibered import (_ANCHOR_PROVIDERS, _CARRIER_GAUGES, _ANCHOR_ARITY)
+            if str(self.mutual_anchor_provider) not in _ANCHOR_PROVIDERS:
+                raise ValueError(
+                    f"mutual_anchor_provider {self.mutual_anchor_provider!r} not in "
+                    f"{_ANCHOR_PROVIDERS}")
+            if str(self.mutual_carrier_gauge) not in _CARRIER_GAUGES:
+                raise ValueError(
+                    f"mutual_carrier_gauge {self.mutual_carrier_gauge!r} not in "
+                    f"{_CARRIER_GAUGES}")
+            channels = self.mutual_anchor_channels
+            if not channels:
+                raise ValueError(
+                    "comprehensive_self_mutual requires mutual_anchor_channels")
+            channels = [int(channel) for channel in channels]
+            arity = _ANCHOR_ARITY.get(str(self.mutual_anchor_provider))
+            if arity is not None and len(channels) != arity:
+                raise ValueError(
+                    f"mutual_anchor_provider {self.mutual_anchor_provider!r} needs exactly "
+                    f"{arity} anchor channel(s), got {len(channels)} ({channels}).")
+            if int(self.bifilt_carrier_channel) in channels:
+                raise ValueError(
+                    "generated mutual carrier and anchor channels must be disjoint")
         if self.mode == "betti_self_mutual":
             # Self cells in this mode use the raw-saliency path.
             if bool(getattr(self, "betti_match_likelihood", False)):
@@ -443,7 +523,7 @@ class TopoLossConfig:
 # Differentiable helpers
 
 def _require_finite(name: str, value) -> None:
-    """Raise at the originating term when a loss is non-finite."""
+    """Fail loud, at the term that broke, instead of propagating NaN into the update."""
     v = value.detach() if hasattr(value, "detach") else torch.as_tensor(float(value))
     if not bool(torch.isfinite(v).all()):
         raise FloatingPointError(f"non-finite topological loss component {name!r}")
@@ -643,7 +723,11 @@ def soft_rcc_loss(
 # Windowed soft RCC.
 
 def _window_starts(extent: int, win: int, stride: int) -> Tuple[List[int], int]:
-    """Return sliding-window starts, including a final flush-right window."""
+    """Top-left start offsets of a sliding window over a 1-D extent.
+
+    Clamps ``win`` to ``extent`` and always appends the flush-right window so the
+    final strip is covered even when ``(extent - win)`` is not a multiple of stride.
+    """
     win = max(1, min(int(win), int(extent)))
     stride = max(1, int(stride))
     if win >= extent:
@@ -1288,9 +1372,9 @@ class DifferentiableTopologicalCoherenceLoss:
         self.field_names = list(field_names) if field_names is not None else None
         if denormalize is not None and denormalize_points is not None:
             raise ValueError("pass only one of denormalize or denormalize_points")
-        # Inverse-normalization callback for point fields.
+        # Preferred ``[B,N,C]`` inverse-normalization callback.
         self._point_denormalizer = denormalize_points
-        # Compatibility callback for grid fields.
+        # Legacy ``[B,C,H,W]`` inverse-normalization callback.
         self._grid_denormalizer = denormalize
         self._denorm_warned = False
         # Periodic grids omit the duplicated endpoint.
@@ -1317,6 +1401,7 @@ class DifferentiableTopologicalCoherenceLoss:
         self._component_grad_ema: Dict[str, torch.Tensor] = {}
         self._component_scales: Dict[str, torch.Tensor] = {}
         self._component_balance_step = 0
+        self._comprehensive_calls = 0
         if cfg.mode == "frozen_reference_stats":
             if cfg.reference_path is None:
                 raise ValueError("mode='frozen_reference_stats' requires cfg.reference_path (.npz)")
@@ -1357,9 +1442,9 @@ class DifferentiableTopologicalCoherenceLoss:
     ) -> torch.Tensor:
         """Combine components with detached inverse-gradient EMA scales.
 
-        Gradient norms are measured against the reconstructed point output and
-        normalized to the median active EMA. The outer topology weight remains
-        separate from these component scales.
+        Gradient norms are measured against the reconstructed point output. The
+        median active EMA is the robust reference, so balancing changes relative
+        component scale without setting the outer topology/data tradeoff.
         """
         if not components:
             return target.sum() * 0.0
@@ -1408,8 +1493,10 @@ class DifferentiableTopologicalCoherenceLoss:
                         if float(scale) <= lo * 1.001 or float(scale) >= hi * 0.999:
                             pinned.append(name)
                     self._component_scales[name] = scale.detach()
-                # Clamp saturation indicates gradient scales outside the
-                # configured balancing range. Warnings are rate limited.
+                # A scale pinned at its clamp is not being balanced: its
+                # gradient differs from the median by more than the clamp
+                # range covers. Warn when a substantial fraction saturates,
+                # rate-limited to one warning per 100 refreshes.
                 if (len(pinned) * 3 > len(components)
                         and self._component_balance_step
                         >= getattr(self, "_balance_pin_warn_after", 0)):
@@ -1604,7 +1691,7 @@ class DifferentiableTopologicalCoherenceLoss:
                 periodic=bool(getattr(self.cfg, "periodic_grid", False)))
         return grid
 
-    # Internal methods.
+    # Internal helpers.
 
     def _pairs(self, c: int) -> List[Tuple[int, int]]:
         if self.cfg.pairs is not None:
@@ -1713,7 +1800,7 @@ class DifferentiableTopologicalCoherenceLoss:
         self._tau0 = [torch.as_tensor(z["tau0"][c], dtype=torch.float32) for c in range(n_chan)]
         self._N_data = [torch.as_tensor(z["N_data"][c], dtype=torch.float32) for c in range(n_chan)]
         self._m_data = [torch.as_tensor(z["m_data"][c], dtype=torch.float32) for c in range(n_chan)]
-        # Compatible references may omit Euler curves.
+        # Euler curves are optional in older references.
         if "chi_data" in z.files:
             self._ec_beta = float(z["ec_beta"])
             self._ec_thresholds = [torch.as_tensor(z["ec_thresholds"][c], dtype=torch.float32) for c in range(n_chan)]
@@ -1926,41 +2013,70 @@ class DifferentiableTopologicalCoherenceLoss:
         eps = cfg.eps
         b, c, h, w = grids_pred.shape
         zero = grids_pred.new_zeros(())
-        s_pred, s_ref = self._topofix_saliency(grids_pred, grids_ref)
-        s_ref = s_ref.detach()
-        thr = self._thresholds(s_ref)
+        physical_levels = str(getattr(
+            cfg, "superlevel_level_mode", "reference_quantile")) == "physical"
+        if physical_levels:
+            # Work in denormalized field units at the same fixed levels as the
+            # integer Betti gate. Paired masks provide the spatial information
+            # that a scalar count lacks: where to carve or close a missing loop.
+            s_pred, s_ref = grids_pred, grids_ref.detach()
+            levels = torch.as_tensor(
+                cfg.superlevel_physical_levels, device=grids_pred.device,
+                dtype=grids_pred.dtype)
+            thr = levels.view(1, -1).expand(c, -1)
+        else:
+            s_pred, s_ref = self._topofix_saliency(grids_pred, grids_ref)
+            s_ref = s_ref.detach()
+            thr = self._thresholds(s_ref)
         beta = float(cfg.superlevel_sharpness)
         per = bool(cfg.periodic_grid)
         chans = list(cfg.channels) if cfg.channels is not None else list(range(c))
         T = thr.shape[1]
         mid = T // 2
+        signs = {
+            "super": (1.0,), "sub": (-1.0,), "both": (1.0, -1.0),
+        }[str(getattr(cfg, "filtration_direction", "super"))]
 
         dice_vals, cldice_vals = [], []
-        for ch in chans:
-            for ti in range(T):
-                a = thr[ch, ti]
-                mp = torch.sigmoid(beta * (s_pred[:, ch] - a)).unsqueeze(1)
-                mr = torch.sigmoid(beta * (s_ref[:, ch] - a)).unsqueeze(1)
-                dice_vals.append(1.0 - soft_dice_overlap(mp, mr, eps))
-            am = thr[ch, mid]
-            # clDice can use a sharper mask than Dice.
-            cbeta = float(cfg.skeleton_sharpness) if cfg.skeleton_sharpness is not None else beta
-            mpc = torch.sigmoid(cbeta * (s_pred[:, ch] - am)).unsqueeze(1)
-            mrc = torch.sigmoid(cbeta * (s_ref[:, ch] - am)).unsqueeze(1)
-            cldice_vals.append(soft_cldice_loss(mpc, mrc, int(cfg.skeleton_iters), per, eps))
+        for sign in signs:
+            for ch in chans:
+                for ti in range(T):
+                    a = thr[ch, ti]
+                    mp = torch.sigmoid(beta * (sign * s_pred[:, ch] - a)).unsqueeze(1)
+                    mr = torch.sigmoid(beta * (sign * s_ref[:, ch] - a)).unsqueeze(1)
+                    dice_vals.append(1.0 - soft_dice_overlap(mp, mr, eps))
+                am = thr[ch, mid]
+                # clDice can use a sharper mask than Dice.
+                cbeta = (float(cfg.skeleton_sharpness)
+                         if cfg.skeleton_sharpness is not None else beta)
+                mpc = torch.sigmoid(cbeta * (sign * s_pred[:, ch] - am)).unsqueeze(1)
+                mrc = torch.sigmoid(cbeta * (sign * s_ref[:, ch] - am)).unsqueeze(1)
+                cldice_vals.append(soft_cldice_loss(
+                    mpc, mrc, int(cfg.skeleton_iters), per, eps))
         L_dice = torch.stack(dice_vals).mean() if dice_vals else zero
         L_cldice = torch.stack(cldice_vals).mean() if cldice_vals else zero
 
         x_vals = []
         if cfg.cross_dice_weight > 0 and pairs:
-            for (i, j) in pairs:
-                mi_p = torch.sigmoid(beta * (s_pred[:, i] - thr[i, mid]))
-                mi_r = torch.sigmoid(beta * (s_ref[:, i] - thr[i, mid]))
-                mj_p = torch.sigmoid(beta * (s_pred[:, j] - thr[j, mid]))
-                mj_r = torch.sigmoid(beta * (s_ref[:, j] - thr[j, mid]))
-                x_vals.append(1.0 - soft_dice_overlap((mi_p * mj_p).unsqueeze(1),
-                                                      (mi_r * mj_r).unsqueeze(1), eps))
+            for sign in signs:
+                for (i, j) in pairs:
+                    mi_p = torch.sigmoid(beta * (sign * s_pred[:, i] - thr[i, mid]))
+                    mi_r = torch.sigmoid(beta * (sign * s_ref[:, i] - thr[i, mid]))
+                    mj_p = torch.sigmoid(beta * (sign * s_pred[:, j] - thr[j, mid]))
+                    mj_r = torch.sigmoid(beta * (sign * s_ref[:, j] - thr[j, mid]))
+                    x_vals.append(1.0 - soft_dice_overlap(
+                        (mi_p * mj_p).unsqueeze(1),
+                        (mi_r * mj_r).unsqueeze(1), eps))
         L_x = torch.stack(x_vals).mean() if x_vals else zero
+
+        if float(cfg.dice_weight) > 0.0:
+            self._record_component("self_region", L_dice, float(cfg.dice_weight))
+        if float(cfg.cldice_weight) > 0.0:
+            self._record_component(
+                "self_connectivity", L_cldice, float(cfg.cldice_weight))
+        if float(cfg.cross_dice_weight) > 0.0 and x_vals:
+            self._record_component(
+                "self_cross_region", L_x, float(cfg.cross_dice_weight))
 
         total = (float(cfg.dice_weight) * L_dice
                  + float(cfg.cldice_weight) * L_cldice
@@ -1972,6 +2088,105 @@ class DifferentiableTopologicalCoherenceLoss:
             "ph": float(L_dice.detach()),
             "mph": float(L_x.detach()),
         }
+        return total, metrics
+
+    def _paired_self_curve_loss(
+        self, grids_pred: torch.Tensor, grids_ref: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """Dimensionless paired H0/H1 curve error at fixed physical levels.
+
+        The count terms make components and loops explicit, while the accompanying
+        Dice/clDice terms provide the spatial inverse that a scalar count lacks.
+        """
+        from .marginal_betti import batched_soft_betti
+
+        cfg = self.cfg
+        if str(cfg.superlevel_level_mode) != "physical":
+            raise ValueError(
+                "comprehensive_self_mutual requires superlevel_level_mode='physical'")
+        levels = torch.as_tensor(
+            cfg.superlevel_physical_levels, device=grids_pred.device,
+            dtype=grids_pred.dtype)
+        fields = (list(cfg.channels) if cfg.channels is not None
+                  else list(range(grids_pred.shape[1])))
+        signs = {"super": (1.0,), "sub": (-1.0,), "both": (1.0, -1.0)}[
+            str(cfg.filtration_direction)]
+        weights = {0: float(cfg.self_h0_weight), 1: float(cfg.self_h1_weight)}
+        active_dims = tuple(
+            dim for dim in cfg.homology_dims if weights[int(dim)] > 0.0)
+        total = grids_pred.new_zeros(())
+        metrics: Dict[str, float] = {}
+        eps = float(cfg.eps)
+        for dim in active_dims:
+            terms = []
+            for sign in signs:
+                for channel in fields:
+                    pred_curve = batched_soft_betti(
+                        sign * grids_pred[:, int(channel)], levels, int(dim),
+                        beta=float(cfg.marginal_beta), kappa=float(cfg.marginal_kappa),
+                        periodic=bool(cfg.periodic_grid))
+                    ref_curve = batched_soft_betti(
+                        sign * grids_ref[:, int(channel)].detach(), levels, int(dim),
+                        beta=float(cfg.marginal_beta), kappa=float(cfg.marginal_kappa),
+                        periodic=bool(cfg.periodic_grid)).detach()
+                    denominator = ref_curve.abs().clamp_min(1.0).sum(dim=-1)
+                    terms.append(
+                        (pred_curve - ref_curve).abs().sum(dim=-1)
+                        / denominator.clamp_min(eps))
+            loss = torch.cat(terms).mean()
+            name = f"self_h{int(dim)}"
+            total = total + weights[int(dim)] * loss
+            self._record_component(name, loss, weights[int(dim)])
+            metrics[name] = float(loss.detach())
+            metrics[f"valid_count/{name}"] = float(grids_pred.shape[0])
+        return total, metrics
+
+    def _paired_self_persistence_loss(
+        self, grids_pred: torch.Tensor, grids_ref: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """Match physical-field H0/H1 birth--death pairs in both directions.
+
+        Betti curves constrain feature counts at the configured thresholds but do
+        not identify how long individual components or loops persist.  This term
+        supplies that missing barcode information while Dice/clDice retain the
+        spatial inverse needed to create or move features.
+        """
+        cfg = self.cfg
+        weights = {
+            0: float(cfg.self_persistence_h0_weight),
+            1: float(cfg.self_persistence_h1_weight),
+        }
+        configured_dims = set(int(value) for value in cfg.homology_dims)
+        dims = tuple(
+            dim for dim in (0, 1)
+            if dim in configured_dims and weights[dim] > 0.0)
+        if not dims:
+            return grids_pred.new_zeros(()), {}
+
+        fields = (list(cfg.channels) if cfg.channels is not None
+                  else list(range(grids_pred.shape[1])))
+        fields = [int(field) for field in fields]
+        signs = {"super": (1.0,), "sub": (-1.0,), "both": (1.0, -1.0)}[
+            str(cfg.filtration_direction)]
+        direction_scale = 1.0 / float(len(signs))
+        periodic_pad = int(cfg.wrap_pad_px) if bool(cfg.periodic_grid) else 0
+        normalize = str(cfg.bar_normalize)
+        total = grids_pred.new_zeros(())
+        metrics: Dict[str, float] = {}
+        reference = grids_ref[:, fields].detach()
+        prediction = grids_pred[:, fields]
+        for dim in dims:
+            loss = grids_pred.new_zeros(())
+            for sign in signs:
+                value, _n_terms = self._self_matching_loss(
+                    sign * prediction, sign * reference, dims=(dim,),
+                    periodic_pad=periodic_pad, normalize=normalize)
+                loss = loss + direction_scale * value
+            name = f"self_persistence_h{dim}"
+            total = total + weights[dim] * loss
+            self._record_component(name, loss, weights[dim])
+            metrics[name] = float(loss.detach())
+            metrics[f"valid_count/{name}"] = float(grids_pred.shape[0])
         return total, metrics
 
     def _bifiltration_loss(self, grids_pred: torch.Tensor, grids_ref: torch.Tensor,
@@ -2155,7 +2370,7 @@ class DifferentiableTopologicalCoherenceLoss:
             metrics["check/soft_rcc_global"] = float(g_soft)
         return total, metrics
 
-    # Public methods.
+    # Public API.
 
     def _betti_match_loss(self, grids_pred: torch.Tensor, grids_ref: torch.Tensor
                     ) -> Tuple[torch.Tensor, Dict[str, float]]:
@@ -2432,17 +2647,27 @@ class DifferentiableTopologicalCoherenceLoss:
         grids_true: torch.Tensor,
         physical_pred: torch.Tensor,
         physical_ref: torch.Tensor,
+        *,
+        persistence_batch_limit: int = 0,
+        persistence_call_index: int = 0,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """Match generated phi/velocity topology to the detached target relationship."""
         from .marginal_betti import batched_soft_betti
         from .mph_fibered import (build_observed_anchor, carrier_descriptor,
-                                  push_forward, sample_admissible_lines,
+                                  fibered_h1_loss_batch, push_forward,
+                                  sample_admissible_lines,
                                   standardize_by_reference)
         cfg = self.cfg
         weights = {0: float(cfg.output_mutual_h0_weight),
                    1: float(cfg.output_mutual_h1_weight)}
+        persistence_weights = {
+            0: float(cfg.output_mutual_persistence_h0_weight),
+            1: float(cfg.output_mutual_persistence_h1_weight),
+        }
         spatial_weight = float(cfg.output_mutual_spatial_weight)
-        if not any(v > 0.0 for v in weights.values()) and spatial_weight == 0.0:
+        if (not any(v > 0.0 for v in weights.values())
+                and not any(v > 0.0 for v in persistence_weights.values())
+                and spatial_weight == 0.0):
             return grids_pred.new_zeros(()), {}
         channels = cfg.mutual_anchor_channels
         if not channels:
@@ -2512,7 +2737,12 @@ class DifferentiableTopologicalCoherenceLoss:
                         ct_curve = batched_soft_betti(
                             ht[None], levels, dim, beta=beta, kappa=kappa,
                             periodic=per)[0].detach()
-                        raw[dim] = raw[dim] + ((cp - ct_curve) ** 2).mean()
+                        if str(cfg.output_mutual_curve_loss) == "nmae":
+                            denominator = ct_curve.abs().clamp_min(1.0).sum()
+                            curve_error = (cp - ct_curve).abs().sum() / denominator
+                        else:
+                            curve_error = ((cp - ct_curve) ** 2).mean()
+                        raw[dim] = raw[dim] + curve_error
 
         total = grids_pred.new_zeros(())
         metrics: Dict[str, float] = {
@@ -2526,6 +2756,45 @@ class DifferentiableTopologicalCoherenceLoss:
             self._record_component(name, loss, weights[dim])
             metrics[name] = float(loss.detach())
             metrics[f"valid_count/{name}"] = float(n_valid)
+
+        persistence_dims = tuple(
+            dim for dim in (0, 1)
+            if dim in configured_dims and persistence_weights[dim] > 0.0)
+        persistence_count = n_valid
+        persistence_index = torch.arange(n_valid, device=c_gen.device)
+        if persistence_dims and 0 < int(persistence_batch_limit) < n_valid:
+            persistence_count = int(persistence_batch_limit)
+            start = (int(persistence_call_index) * persistence_count) % n_valid
+            persistence_index = (
+                torch.arange(persistence_count, device=c_gen.device) + start
+            ) % n_valid
+        c_gen_p, c_true_p = c_gen[persistence_index], c_true[persistence_index]
+        a_gen_p, a_true_p = a_gen[persistence_index], a_true[persistence_index]
+        for dim in persistence_dims:
+            loss = grids_pred.new_zeros(())
+            for sign in signs:
+                value, _persistence_metrics = fibered_h1_loss_batch(
+                    sign * c_gen_p, a_gen_p, sign * c_true_p, a_true_p,
+                    dims=(dim,), n_lines=int(cfg.bifilt_n_lines),
+                    theta_min_deg=float(cfg.bifilt_theta_min_deg),
+                    q_lo=float(cfg.bifilt_offset_q_lo),
+                    q_hi=float(cfg.bifilt_offset_q_hi),
+                    axis_map=str(cfg.bifilt_axis_map),
+                    periodic_pad=(int(cfg.wrap_pad_px) if per else 0),
+                    normalize=str(cfg.bar_normalize),
+                    line_sampling=str(cfg.bifilt_line_sampling),
+                    matching=str(cfg.matching_backend),
+                    lambda_spatial=float(cfg.lambda_spatial_mutual),
+                    spatial_mode=str(cfg.spatial_mode))
+                loss = loss + direction_scale * value
+            name = f"output_mutual_persistence_h{dim}"
+            total = total + persistence_weights[dim] * loss
+            self._record_component(name, loss, persistence_weights[dim])
+            metrics[name] = float(loss.detach())
+            metrics[f"valid_count/{name}"] = float(persistence_count)
+        if persistence_dims:
+            metrics["persistence_sample_fraction"] = (
+                float(persistence_count) / max(n_valid, 1))
         binding_frac = carrier_binding / max(nslices, 1)
         reference_binding_frac = reference_carrier_binding / max(nslices, 1)
         metrics["output_mutual_carrier_binding_frac"] = binding_frac
@@ -2568,8 +2837,11 @@ class DifferentiableTopologicalCoherenceLoss:
         if len(pred_pushforwards) != len(true_pushforwards) or not pred_pushforwards:
             raise ValueError("predicted and target slice lists must be non-empty and aligned")
         targets = [t.detach() for t in true_pushforwards]
-        # Pool levels across slices because per-slice quantiles can collapse
-        # onto the hard-min floor. Per-slice errors prevent cancellation.
+        # Pool levels across slices, not per-slice: the hard-min pushforward
+        # is floor-dominated (large exact-zero background), so a slice's own
+        # quantiles collapse onto the floor and can miss the levels where H1
+        # is alive. The per-slice squared error below is deliberate: it
+        # prevents cancellation across slices.
         levels = torch.quantile(
             torch.stack([t.reshape(-1) for t in targets]).reshape(-1), quantiles)
         losses = []
@@ -2982,19 +3254,30 @@ class DifferentiableTopologicalCoherenceLoss:
             m = values.mean(dim=0)
             second = values.square().mean(dim=0)
             k = (ema_key, r)
-            ema = self._marg_ema.get(k)
-            ema = m.detach().clone() if ema is None else (decay * ema + (1.0 - decay) * m.detach())
-            second_ema = getattr(self, "_marg_second_ema", {}).get(k)
-            second_ema = (second.detach().clone() if second_ema is None else
-                          decay * second_ema + (1.0 - decay) * second.detach())
+            previous_ema = self._marg_ema.get(k)
+            first_observation = previous_ema is None
+            ema = (m.detach().clone() if first_observation else
+                   decay * previous_ema + (1.0 - decay) * m.detach())
+            previous_second = getattr(self, "_marg_second_ema", {}).get(k)
+            second_ema = (second.detach().clone() if previous_second is None else
+                          decay * previous_second + (1.0 - decay) * second.detach())
             frozen = bool(getattr(self, "_marg_freeze", False))
             if not frozen:
                 self._marg_ema[k] = ema
                 self._marg_second_ema[k] = second_ema
-            # Validation reads the held-out batch without updating the EMA.
-            est = m if frozen else ema.detach() + (m - m.detach())
+            # Validation reads the held-out batch without updating the EMA. In
+            # training, the straight-through derivative must match the actual
+            # EMA update: after initialization only (1-decay) of the new batch
+            # enters the state. Passing the full derivative here made a decay of
+            # 0.9 produce a 10x-too-large, noisy gradient while the forward EMA
+            # moved by only 10%.
+            ema_mix = 1.0 if first_observation else (1.0 - decay)
+            second_mix = 1.0 if previous_second is None else (1.0 - decay)
+            est = (m if frozen else
+                   ema.detach() + ema_mix * (m - m.detach()))
             second_est = (second if frozen else
-                          second_ema.detach() + (second - second.detach()))
+                          second_ema.detach()
+                          + second_mix * (second - second.detach()))
             diff = est - ref
             pen = torch.relu(diff) if sign > 0 else (torch.relu(-diff) if sign < 0 else diff)
             out = out + (pen ** 2).mean()
@@ -3244,6 +3527,8 @@ class DifferentiableTopologicalCoherenceLoss:
             output_mutual_active = any(float(v) > 0.0 for v in (
                 getattr(self.cfg, "output_mutual_h0_weight", 0.0),
                 getattr(self.cfg, "output_mutual_h1_weight", 0.0),
+                getattr(self.cfg, "output_mutual_persistence_h0_weight", 0.0),
+                getattr(self.cfg, "output_mutual_persistence_h1_weight", 0.0),
                 getattr(self.cfg, "output_mutual_spatial_weight", 0.0)))
             grids_true_m = self._rasterize_reference(x_ref) if observed_anchor else None
             physical_ref = (self._rasterize_reference(x_ref, physical=True)
@@ -3312,7 +3597,13 @@ class DifferentiableTopologicalCoherenceLoss:
             metrics["topo_loss"] = float(total.detach())
             return total, metrics
 
-        grids_ref = self._rasterize_reference(x_ref)
+        if (self.cfg.mode == "superlevel_overlap"
+                and str(getattr(self.cfg, "superlevel_level_mode",
+                                "reference_quantile")) == "physical"):
+            grids_pred = self._rasterize_physical_prediction(x_pred)
+            grids_ref = self._rasterize_reference(x_ref, physical=True)
+        else:
+            grids_ref = self._rasterize_reference(x_ref)
         physical_anchor_ref = (
             self._rasterize_reference(x_ref, physical=True) if observed_anchor else None)
 
@@ -3330,6 +3621,61 @@ class DifferentiableTopologicalCoherenceLoss:
         # Super-level Dice and clDice.
         if self.cfg.mode == "superlevel_overlap":
             total, metrics = self._topofix_loss(grids_pred, grids_ref, pairs)
+            metrics["topo_loss"] = float(total.detach())
+            return total, metrics
+
+        # One aligned objective spanning self components/loops/connectivity and
+        # generated phi-vorticity joint topology/spatial placement.
+        if self.cfg.mode == "comprehensive_self_mutual":
+            if str(self.cfg.target) != "paired":
+                raise ValueError("comprehensive_self_mutual requires target='paired'")
+            normalized_pred = grids_pred
+            normalized_ref = grids_ref
+            physical_pred = self._rasterize_physical_prediction(x_pred)
+            physical_ref = self._rasterize_reference(x_ref, physical=True)
+            self._component_sink = {}
+            self._component_weights = {}
+            call_index = int(self._comprehensive_calls)
+            self._comprehensive_calls += 1
+            persistence_limit = int(
+                self.cfg.persistence_train_batch_size if torch.is_grad_enabled()
+                else self.cfg.persistence_eval_batch_size)
+            persistence_count = physical_pred.shape[0]
+            persistence_index = torch.arange(
+                persistence_count, device=physical_pred.device)
+            if 0 < persistence_limit < persistence_count:
+                persistence_count = persistence_limit
+                start = (call_index * persistence_count) % physical_pred.shape[0]
+                persistence_index = (
+                    torch.arange(persistence_count, device=physical_pred.device)
+                    + start
+                ) % physical_pred.shape[0]
+            self_curves, curve_metrics = self._paired_self_curve_loss(
+                physical_pred, physical_ref)
+            self_persistence, persistence_metrics = (
+                self._paired_self_persistence_loss(
+                    physical_pred[persistence_index], physical_ref[persistence_index]))
+            if persistence_metrics:
+                persistence_metrics["self_persistence_sample_fraction"] = (
+                    float(persistence_count) / max(physical_pred.shape[0], 1))
+            self_spatial, spatial_metrics = self._topofix_loss(
+                physical_pred, physical_ref, pairs)
+            mutual, mutual_metrics = self._generated_output_mutual_loss(
+                normalized_pred, normalized_ref, physical_pred, physical_ref,
+                persistence_batch_limit=persistence_limit,
+                persistence_call_index=call_index)
+            unbalanced = self_curves + self_persistence + self_spatial + mutual
+            metrics = {
+                **curve_metrics, **persistence_metrics,
+                **spatial_metrics, **mutual_metrics,
+            }
+            total = self._finish_components(unbalanced, x_pred, metrics)
+            selection = sum(
+                (float(self._component_weights.get(name, 1.0)) * raw
+                 for name, raw in self._last_component_tensors.items()),
+                unbalanced.new_zeros(()))
+            metrics["topo_unbalanced_loss"] = float(unbalanced.detach())
+            metrics["topo_selection_loss"] = float(selection.detach())
             metrics["topo_loss"] = float(total.detach())
             return total, metrics
 

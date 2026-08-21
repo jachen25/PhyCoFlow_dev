@@ -1,0 +1,138 @@
+# N17 mean-pooled coarse-phi super-resolution base (the A/B arm against the
+# N16 point-decimated lattice).
+# Conditioning is ONLY the composition field phi observed as the MEAN over
+# every 8x8 block of the 128x128 grid (16x16 = 256 pooled observations at the
+# block centroids, 8x super-resolution per axis) — the same coarse-graining
+# operator the upstream 1_SubTask_SuperResolution uses to build its low-res
+# data (average_pool_frames + cell-center coordinates). A block mean encodes
+# the phases' volume fraction inside the block, so unlike a stride-8 point
+# sample it registers droplets and interfaces sitting BETWEEN lattice nodes.
+# The model generates the full-resolution phi AND the never-observed velocity
+# components (vx, vy); vorticity is derived as w = dvx/dy - dvy/dx (w_from_v
+# panel), identical to N16.
+#
+# Because a block mean is NOT the field value at any single pixel, pooled
+# observations are never hard-clamped into the generated field: sampling
+# auto-switches to obs_consistency_mode='endpoint_smooth' with no final
+# clamp (resolve_pooled_obs_consistency). The default smooth sigma 0.05 is
+# ~ the pooled cell size 8/127 = 0.063 in normalized coordinates.
+#
+# translate/rot90 augmentation moves the field under the fixed pooling grid,
+# so the model cannot memorize block values at fixed block positions.
+
+Demo_Num: 17
+device_ids: [0]
+
+dataset: "active_emulsion"
+ae_data_root: "~/orcd/pool/active_emulsion_dataset/data_half_885"
+ae_protocol: "interp"
+# No w channel: vorticity is derived from the generated velocity, not modeled.
+ae_fields: ["phi", "vx", "vy"]
+data: "Dataset"
+
+save_dir: "Save_TrainedModel/ffm_ae_pointcloud_coarsephi_sr_pool"
+
+seed : 42
+epochs : 10000
+batch_size : 64
+lr : 1.0e-4
+weight_decay : 1.0e-4
+num_workers : 12
+
+initialization: "scratch"
+
+# Generating parameters (H, R, m) are experiment control knobs, known at
+# inference; keep conditioning consistent with the N15/N16 recipe.
+param_conditioning: true
+param_n_freq: 4
+param_jitter: 0.1
+param_dropout: 0.1
+param_embed_hidden: 128
+
+backbone: "GL_rbf_ENH"
+
+hidden_dim : 256
+cond_dim : 128
+field_embed_dim : 128
+sigma_min : 1.0e-4
+rbf_sigma : 0.05
+
+use_fourier_pe: true
+pe_num_bands: 32
+pe_max_freq: 64.0
+
+latent_dim: 256
+num_latents: 128
+num_heads: 8
+num_latent_blocks: 4
+ff_mult: 4
+attn_dropout: 0.1
+mlp_dropout: 0.1
+decode_chunk_size: 4096
+share_query_proj: false
+
+summary_type: "mean"
+
+gather_mode: "topk_rbf_glres"
+gather_topk: 32
+sensor_local_topk: 16
+gather_query_chunk_size: 2048
+learnable_rbf_sigma: true
+neighbor_backend: "keops"
+sensor_local_dropout: 0.0
+
+sensor_coord_encoding: "fourier"
+latent_sensor_reinject: true
+latent_reinject_every: 1
+query_latent_readout: true
+query_readout_type: "coord"
+query_readout_scale_init: 1.0e-2
+enhanced_head_norm: true
+glres_scale_init: 1.0e-2
+
+Num_x: 128
+Num_y: 128
+fno_modes_x: 24
+fno_modes_y: 24
+fno_hidden_channels: 64
+fno_n_layers: 4
+condition_blur: true
+condition_blur_kernel: 15
+condition_blur_sigma: 2.5
+
+n_query_points : 2048
+prior : "rff"
+rff_features : 256
+rff_lengthscale : 0.15
+
+eval_every : 5
+save_every : 200
+snapshot_every : 10000
+snapshot_keep : 1
+n_steps_generation : 32
+
+# Single conditioned field: phi (index 0 in ae_fields above). The stride
+# defines the 8x8 pooling blocks (16x16 = 256 pooled observations);
+# obs_grid_pool switches the strided observation from the node VALUE to the
+# block MEAN at the block centroid. The n_obs bounds are ignored for strided
+# fields but must be present and length-matched.
+cond_fields :   [0]
+n_obs_min_list: [256]
+n_obs_max_list: [256]
+obs_grid_stride_list: [8]
+obs_grid_pool: true
+
+vis_cond_fields: [0]
+vis_n_obs_list: [256]
+vis_obs_grid_stride_list: [8]
+
+ae_flow_transform: "asinh"
+
+ae_frame_downsample: true
+ae_frame_tau: 0.02
+ae_frame_min: 4
+
+ae_augment: "translate_rot90"
+
+ode_solver : "euler"
+benchmark_n_steps : [2, 4, 8]

@@ -1,0 +1,37 @@
+# N23 epoch-matched data-only control for N22. It inherits the same N19 source
+# and uses N22's balanced training batches/schedule, but never applies topology.
+extends: config_pointcloud_ffm_selfmutObs_posttrain_N19.yaml
+
+Demo_Num: 23
+save_dir: Save_TrainedModel/ffm_ae_pointcloud_dataonly_topofixN23
+RELOAD: true
+epochs: 1000
+direct_coherence_enabled: false
+pareto_selection_enabled: false
+
+topo_stratified_train_batches: true
+topo_min_train_strata: 12
+coherence_batch_size: 12
+coherence_every_n_steps: 8
+epi_rollout_steps: 16
+topo_rollout_gradient_mode: random_step
+topo_normalize_constrained_gradient: true
+topo_gradient_ratio_start: 0.25
+topo_gradient_ratio_end: 0.05
+topo_gradient_ratio_decay_epochs: 1000
+gradient_clip_norm: 0.0
+
+topo_homology_dims: [1]
+topo_self_h0_weight: 0.0
+topo_self_h1_weight: 1.0
+topo_mutual_h0_weight: 0.0
+topo_mutual_h1_weight: 0.0
+topo_mutual_spatial_weight: 0.0
+topo_marginal_variance_weight: 0.0
+topo_component_balance_enabled: false
+
+topo_stratified_val_batches: true
+val_coherence_batches: 4
+eval_every: 10
+save_every: 10
+snapshot_every: 10

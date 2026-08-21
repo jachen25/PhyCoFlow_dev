@@ -523,6 +523,44 @@ def test_n19_resume_and_evaluator_defaults():
         )
         assert selected_best == active
 
+        # The full-dataset evaluator must use the same checkpoint-bearing run
+        # even when a newer resume YAML has no timestamp-matched directory.
+        import argparse
+        import evaluate_full_dataset
+        cfg_dir = (root / "Save_config" / "active_emulsion"
+                   / "pointcloud_ffm")
+        cfg_dir.mkdir(parents=True)
+        (cfg_dir / "config_pointcloud_ffm_DemoN19_20260103_000000.yaml").write_text(
+            "dataset: active_emulsion\n"
+            "save_dir: Save_TrainedModel/demo\n")
+        (active / "args.json").write_text(
+            '{"dataset":"active_emulsion",'
+            '"save_dir":"Save_TrainedModel/demo",'
+            '"effective_marker":19}')
+
+        class DatasetStub:
+            pass
+
+        old_build_dataset = evaluate_full_dataset._build_dataset
+        old_build_model = evaluate_full_dataset._build_model
+        old_load_checkpoint = evaluate_full_dataset._load_checkpoint
+        evaluate_full_dataset._build_dataset = lambda *a, **k: DatasetStub()
+        evaluate_full_dataset._build_model = lambda *a, **k: torch.nn.Linear(1, 1)
+        evaluate_full_dataset._load_checkpoint = lambda *a, **k: {
+            "model": torch.nn.Linear(1, 1).state_dict(), "epoch": 7}
+        try:
+            runtime = evaluate_full_dataset._load_model_and_config(
+                argparse.Namespace(
+                    demo_root=str(root), dataset="active_emulsion",
+                    Demo_Num=19, checkpoint="best"))
+        finally:
+            evaluate_full_dataset._build_dataset = old_build_dataset
+            evaluate_full_dataset._build_model = old_build_model
+            evaluate_full_dataset._load_checkpoint = old_load_checkpoint
+        assert runtime["model_root"] == active
+        assert runtime["train_timestamp"] == "20260102_000000"
+        assert runtime["cfg"]["effective_marker"] == 19
+
         loss_dir = root / "losses" / "Loss_DemoN19_20260102_000000"
         loss_dir.mkdir(parents=True)
         csv_path = loss_dir / "losses.csv"

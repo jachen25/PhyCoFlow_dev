@@ -121,7 +121,7 @@ def _score_sample(
     return total + count_pen, per_pair, count_pen, n_empty_patched, n_cells
 
 
-# Optional worker-process state.
+# Optional scoring-worker state.
 _WORKER_TC: Optional[TopologicalCoherence] = None
 _WORKER_CFG: Optional[TopoCoherenceRewardConfig] = None
 
@@ -157,8 +157,9 @@ class PointCloudGridRasterizer:
         self.periodic = bool(periodic)
         self.antialias_downsample = bool(antialias_downsample)
 
-        # Full Cartesian inputs support direct area downsampling. Sorting makes
-        # the operation independent of point-cloud storage order.
+        # A full Cartesian input can be downsampled without first selecting a
+        # target-grid sublattice.  The sorted index makes this independent of
+        # the point-cloud storage order.
         self._area_order_cpu: Optional[torch.Tensor] = None
         self._area_order_per_device: Dict[torch.device, torch.Tensor] = {}
         self._area_input_hw: Optional[Tuple[int, int]] = None
@@ -310,7 +311,7 @@ class TopoCoherenceReward:
             )
         return self._pool
 
-    # Internal methods.
+    # Internal helpers.
 
     @staticmethod
     def _ref_key(x_ref_b: torch.Tensor) -> bytes:
@@ -356,7 +357,7 @@ class TopoCoherenceReward:
         # Include count-penalty headroom.
         return base * (1.0 + self.cfg.count_penalty_weight)
 
-    # Public method.
+    # Public API.
 
     def __call__(
         self,
@@ -391,7 +392,7 @@ class TopoCoherenceReward:
 
         finite = torch.isfinite(x_gen).flatten(1).all(dim=1)
         if not torch.isfinite(x_ref).all():
-            # Non-finite references are not cacheable.
+            # Invalid references cannot be cached safely.
             raise ValueError("x_ref contains non-finite values")
         with torch.no_grad():
             grids_gen = self.rasterizer.to_grid(

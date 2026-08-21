@@ -54,15 +54,15 @@ except ImportError:
 
 def parse_args():
     p = argparse.ArgumentParser("Standalone evaluator for trained FFM models.")
-    p.add_argument("--Demo-Num", dest="Demo_Num", type=int, required=True,
+    p.add_argument("--Demo-Num", dest="Demo_Num", type=int, required=True, 
                    help="Demo ID to recover.")
-    p.add_argument("--demo-root", type=str, default=".",
+    p.add_argument("--demo-root", type=str, default=".", 
                    help="Project/demo root directory.")
-    p.add_argument("--split", type=str, default="test",
+    p.add_argument("--split", type=str, default="test", 
                    choices=["train", "val", "test"])
-    p.add_argument("--snapshot-index", type=int, default=0,
+    p.add_argument("--snapshot-index", type=int, default=0, 
                    help="Index within the selected split.")
-
+    
     p.add_argument("--vis-cond-fields", type=int, nargs="+", default=None,
                    help="Override visualization cond_fields. Defaults to YAML vis_cond_fields or cond_fields.")
     p.add_argument("--vis-n-obs-list", type=int, nargs="+", default=None,
@@ -70,22 +70,26 @@ def parse_args():
     p.add_argument("--vis-obs-grid-stride-list", type=int, nargs="+", default=None,
                    help="Override visualization coarse-grid strides (0 = random sensors). "
                         "Defaults to YAML vis_obs_grid_stride_list / obs_grid_stride_list.")
-
+    
     p.add_argument("--checkpoint", type=str, default="best", choices=["best", "last"],
                    help="Which checkpoint to load from the recovered run directory.")
     p.add_argument("--n-steps-generation", type=int, default=None,
                    help="Override generation steps. Defaults to YAML n_steps_generation if present.")
     p.add_argument("--device", type=str, default=None, help="e.g. cuda:0 or cpu")
-
-    # Optional structured-grid diagnostics.
-    p.add_argument("--extra-metrics", type=str, nargs="*", default=[], choices=["ssim", "grad", "spectrum"],
+    
+    # Added extra metrics for evaluation
+    # Run like; python src/evaluate_ffm.py --Demo-Num 0 --split test --snapshot-index 0  --extra-metrics ssim grad spectrum --save-analysis-npz
+    p.add_argument("--extra-metrics", type=str, nargs="*", default=[], choices=["ssim", "grad", "spectrum"], 
                    help="Optional extra metrics to compute on structured 2D grids.",)
+    # SSIM: higher is better; SSIM = 1.0 → perfect structural match
+    # grad_rel_l2: smaller is better, below ~0.3 are very good, above ~0.7 means the local derivative is not being captured well
     p.add_argument("--save-analysis-npz", action="store_true",
                    help="If set, save per-field intermediate arrays (grids, gradients, spectra) to .npz files.",
     )
 
-    # Multi-dataset dispatch and benchmark options shared by evaluation
-    # configurations across backbones.
+    # Multi-dataset dispatch + benchmark sweeps. Args mirror those in
+    # evaluate_latentfm.py / evaluate_sit.py (--dataset, --benchmark-*,
+    # --ode-solver) so eval configs are interchangeable across backbones.
     p.add_argument("--dataset", type=str, default=None,
                    choices=["turbulent_combustion", "poisson", "elasticity",
                             "airfoil", "airfoil_interp", "airfoil_interp_5f",
@@ -116,7 +120,9 @@ def parse_args():
         help="Also compute domain-specific integrated metrics "
              "(Cl/Cd/Cp for airfoil, F_drag/Cd_p/Cp for car-cfd, "
              "max von-Mises + K_t for elasticity).")
-    # Arrays consumed by the domain-specific visualization routines.
+    # Hooks that unlock the richer physics_metrics.py visualizations
+    # (Cp(x/c) chordwise curves, sensor-overlay triptychs,
+    # uncertainty / error-vs-distance scatter, continuity residual, etc.).
     p.add_argument(
         "--save-arrays", action="store_true",
         help="Dump per-snapshot .npz with truth/recon/sensor arrays + mesh "
@@ -190,14 +196,14 @@ def parse_args():
         help="Force mean-pooled coarse observations (block means at block "
              "centroids) for strided fields. Default: the training YAML's "
              "obs_grid_pool. Pooled sampling defaults to raw conditional "
-             "generation with no final clamp.",
+             "generation with no pointwise clamp; endpoint_smooth is opt-in.",
     )
     p.add_argument(
         "--obs-grid-pool-physical",
         action=argparse.BooleanOptionalAction,
         default=None,
-        help="Override whether pooled values are averaged in physical space "
-             "before the dataset's nonlinear normalization.",
+        help="Override whether pooled nonlinear fields are averaged in raw "
+             "physical units before normalization. Defaults to the run config.",
     )
 
     return p.parse_args()
@@ -212,7 +218,9 @@ def _extract_timestamp(path: Path) -> Optional[str]:
 def _find_latest_yaml(cfg_dir: Path, demo_num: int,
                       dataset_filter: Optional[str] = None) -> Path:
     pattern = f"config_pointcloud_ffm_DemoN{demo_num}_*.yaml"
-    # Search recursively when cfg_dir spans multiple dataset directories.
+    # cfg_dir can be either an exact backup folder
+    # (Save_config/<dataset>/pointcloud_ffm) or the Save_config root when
+    # --dataset is omitted; in the latter case recurse into all dataset folders.
     if (cfg_dir / "pointcloud_ffm").exists() or cfg_dir.name == "Save_config":
         candidates = sorted(cfg_dir.rglob(pattern))
     else:
@@ -222,7 +230,10 @@ def _find_latest_yaml(cfg_dir: Path, demo_num: int,
             f"No config backup found for Demo_Num={demo_num} in {cfg_dir}"
         )
 
-    # Demo numbers are not unique across datasets, so filter by dataset first.
+    # Demo_Num collides across datasets (e.g. DemoN3 was used for both
+    # airfoil and elasticity), so when --dataset is provided we filter
+    # candidates whose YAML `dataset:` field matches before picking the
+    # latest by timestamp.
     if dataset_filter is not None:
         filtered = []
         for p in candidates:
@@ -254,11 +265,12 @@ def _find_latest_checkpoint_run(
     demo_num: int,
     checkpoint: str,
 ) -> Path:
-    """Find the latest active checkpoint run independently of YAML time.
+    """Find the latest checkpoint-bearing run independently of YAML time.
 
-    RELOAD submissions resume the original run directory but may archive a new
-    YAML timestamp. Rank eligible runs by ``last.pt`` activity while requiring
-    the requested checkpoint to exist.
+    Every RELOAD submission archives a new YAML timestamp but resumes the
+    original run directory. Selecting a run by the newest YAML timestamp thus
+    breaks after the first resume. Checkpoint mtime is the authoritative run
+    activity signal; the selected run's args.json is loaded by ``main`` below.
     """
     save_dir_cfg = Path(
         cfg.get("save_dir", "Save_TrainedModel/ffm_tc_pointcloud"))
@@ -278,14 +290,16 @@ def _find_latest_checkpoint_run(
             if resolved in seen or not run_dir.is_dir():
                 continue
             seen.add(resolved)
-            requested = run_dir / f"{checkpoint}.pt"
-            if not requested.exists():
-                continue
-            activity = run_dir / "last.pt"
-            if not activity.exists():
-                activity = requested
-            candidates.append((
-                activity.stat().st_mtime_ns, run_dir.name, run_dir))
+            ckpt = run_dir / f"{checkpoint}.pt"
+            if ckpt.exists():
+                # Select the most recently active run, even when evaluating
+                # ``best.pt`` (which may remain unchanged for many resumed
+                # epochs). Eligibility still requires the requested file.
+                activity_ckpt = run_dir / "last.pt"
+                if not activity_ckpt.exists():
+                    activity_ckpt = ckpt
+                candidates.append((
+                    activity_ckpt.stat().st_mtime_ns, run_dir.name, run_dir))
     if not candidates:
         expected = roots[0] / f"{prefix}<timestamp>" / f"{checkpoint}.pt"
         raise FileNotFoundError(
@@ -365,7 +379,8 @@ def _build_model(cfg: dict, dataset) -> torch.nn.Module:
         if names is None or mu is None or sigma is None or log_mask is None:
             raise ValueError(
                 "param_conditioning=true, but the evaluation dataset does not "
-                "expose PARAM_NAMES/PARAM_LOG/param_mu/param_sigma.")
+                "expose PARAM_NAMES/PARAM_LOG/param_mu/param_sigma."
+            )
         param_kwargs = dict(
             n_params=len(names),
             param_log_mask=list(log_mask),
@@ -416,7 +431,8 @@ def _build_model(cfg: dict, dataset) -> torch.nn.Module:
 
     if backbone_name in ["GL_rbf", "GL_rbf_ENH"]:
         enhanced = backbone_name == "GL_rbf_ENH"
-        # Base GL-RBF configurations use raw sensors and zero-scale readout.
+        # Enhanced defaults mirror training: legacy GL_rbf checkpoints keep their
+        # original raw-sensor, point-readout, zero-scale behavior.
         sensor_coord_encoding = cfg.get("sensor_coord_encoding", "fourier" if enhanced else "raw")
         latent_sensor_reinject = cfg.get("latent_sensor_reinject", enhanced)
         query_latent_readout = cfg.get("query_latent_readout", enhanced)
@@ -495,11 +511,23 @@ def _infer_structured_grid_from_coords(
     num_y: Optional[int] = None,
     grid_shape: Optional[Sequence[int]] = None,
 ):
-    """Recover a structured 2D grid description from point coordinates.
-
-    An explicit ``grid_shape`` takes precedence, followed by configured grid
-    dimensions and coordinate-based inference. The returned
-    ``computational_space`` flag identifies the explicit row-major branch.
+    """
+    Recover a structured 2D grid description from point coordinates.
+    Priority:
+      0) If ``grid_shape=(ny, nx)`` is provided (typically from a dataset
+         that natively stores its field row-major in (j, i) over a
+         curvilinear mesh, e.g. AirfoilCGridDataset's 51x221 C-grid), use
+         identity ordering with unit dx/dy. The "computational_space" flag
+         is set on the return so callers can decide whether 2D-FFT-based
+         metrics are physically meaningful (they are not for stretched
+         curvilinear grids -- prefer a body-trace 1D spectrum there). SSIM,
+         which is topology-agnostic, IS meaningful and uses this branch.
+      1) If YAML provides num_x and num_y and num_x*num_y == N, use them
+         with lexicographic ordering on physical coords. Appropriate only
+         for Cartesian grids.
+      2) Otherwise, infer (ny, nx) from unique rounded x/y coordinates.
+      3) If none works, raise ValueError.
+    Returns dict including "computational_space" (True if option 0 fired).
     """
     n_pts = coords_xy.shape[0]
 
@@ -524,7 +552,9 @@ def _infer_structured_grid_from_coords(
     x = np.round(coords_xy[:, 0], decimals=decimals)
     y = np.round(coords_xy[:, 1], decimals=decimals)
 
-    # Use the configured Cartesian grid shape when valid.
+    # ----------------------------------------------------------
+    # Option 1: use explicit grid shape from YAML/config if valid
+    # ----------------------------------------------------------
     if num_x is not None and num_y is not None:
         nx = int(num_x)
         ny = int(num_y)
@@ -536,8 +566,8 @@ def _infer_structured_grid_from_coords(
             unique_x = np.unique(x)
             unique_y = np.unique(y)
 
-            # Coordinate noise may perturb unique-value counts; the configured
-            # shape remains authoritative.
+            # Even if the unique counts do not exactly match because of coordinate
+            # noise or duplicated values, the explicit YAML shape is the primary source.
             dx = float(np.mean(np.diff(unique_x))) if len(unique_x) > 1 else 1.0
             dy = float(np.mean(np.diff(unique_y))) if len(unique_y) > 1 else 1.0
 
@@ -557,7 +587,9 @@ def _infer_structured_grid_from_coords(
                 f"N={n_pts}; falling back to coordinate inference."
             )
 
-    # Otherwise infer the shape from the coordinates.
+    # ----------------------------------------------------------
+    # Option 2: infer from coordinates
+    # ----------------------------------------------------------
     unique_x = np.unique(x)
     unique_y = np.unique(y)
 
@@ -673,7 +705,13 @@ def _gradient_metrics(u: np.ndarray, v: np.ndarray, dx: float, dy: float) -> Tup
 
 
 def _radial_spectrum(u: np.ndarray, dx: float, dy: float):
-    """Compute a shell-averaged 2D spectrum using native FFT spacing."""
+    """
+    Sharper shell-averaged 2D power spectrum of a zero-mean field.
+
+    Compared with the previous coarse linear binning, this version builds
+    spectral shells using the native FFT grid spacing, which preserves much
+    more detail in the radial spectrum and produces sharper curves.
+    """
     ny, nx = u.shape
     uu = u - np.mean(u)
 
@@ -819,8 +857,10 @@ def _spectral_metrics(u: np.ndarray, v: np.ndarray, dx: float, dy: float):
 def _surface_radial_spectrum_1d(f_body: np.ndarray) -> Dict[str, np.ndarray]:
     """Periodic 1D power spectrum of a closed-contour scalar trace.
 
-    The trace is ordered counterclockwise around a closed boundary. The mean
-    is removed before the one-sided spectrum is computed.
+    The body trace is a single CCW pass around a closed boundary (e.g.
+    the airfoil body), so the underlying signal is genuinely periodic --
+    no windowing, no Gibbs artefact. DC is removed so the spectrum
+    captures variation only; the bulk surface level is not "spectral".
 
     Args:
         f_body: shape (M,) -- scalar field along the body, ordered CCW.
@@ -848,10 +888,16 @@ def _surface_radial_spectrum_1d(f_body: np.ndarray) -> Dict[str, np.ndarray]:
 def _surface_spectral_metrics(
     u_body: np.ndarray, v_body: np.ndarray
 ) -> Tuple[Dict[str, float], Dict[str, np.ndarray]]:
-    """Compare periodic spectra of two body-ordered traces.
+    """1D periodic spectral comparison of two body-ordered traces.
 
-    Integer cycle-per-perimeter bands split the nonzero spectrum into thirds
-    of the Nyquist range.
+    Use this for boundary-conforming datasets (e.g. airfoil) where the
+    physically meaningful spectrum is the wavenumber content of the
+    field traced once around the closed body. Bands are integer-cycle-
+    per-perimeter ranges split by thirds of Nyquist; aerodynamic
+    interpretation for an airfoil pressure trace is roughly:
+        large  -- fore/aft asymmetry, integrated loading;
+        medium -- suction-peak / pressure-recovery shape;
+        small  -- sharp local features (shock / separation onset).
     """
     su = _surface_radial_spectrum_1d(u_body)
     sv = _surface_radial_spectrum_1d(v_body)
@@ -968,8 +1014,11 @@ def _save_band_energy_plot(
     fig.savefig(save_path, dpi=220)
     plt.close(fig)
 
+# Dataset dispatch verified: configs use dataset tags in
+# {turbulent_combustion, poisson, elasticity, airfoil}; each constructor
+# exercised empirically (shapes: elasticity 1681x2, airfoil 11271x5).
 def _build_dataset(cfg: dict, split: str, demo_root: Path, stats_path: str):
-    """Dispatch dataset construction across supported datasets."""
+    """Dispatch dataset construction across the supported datasets."""
     dataset_tag = cfg.get("dataset", "turbulent_combustion")
     _default_data = {
         "turbulent_combustion": "Dataset/Merged_CH4COTU1P.h5",
@@ -1001,6 +1050,7 @@ def _build_dataset(cfg: dict, split: str, demo_root: Path, stats_path: str):
             fields=tuple(cfg.get("ae_fields", ("phi",))), seed=seed,
             stats_path=stats_path,
             flow_transform=cfg.get("ae_flow_transform", "asinh"),
+            # Evaluation must use the complete canonical split.
             frame_downsample=False, augment="none",
             pool_observations_physical=bool(
                 cfg.get("obs_grid_pool_physical", False)),
@@ -1051,7 +1101,9 @@ def _build_dataset(cfg: dict, split: str, demo_root: Path, stats_path: str):
     raise ValueError(f"Unknown dataset: {dataset_tag}")
 
 
-# Snapshot evaluator with structured-mesh and body-overlay support.
+# Body-aware snapshot evaluator. Mirrors visualize_reconstruction for the
+# TC path but routes through _build_structured_triangulation (row-major)
+# and body_polygon overlay for C-grid airfoil plots.
 @torch.no_grad()
 def _evaluate_ffm_snapshot(
     model, dataset, device, save_dir,
@@ -1074,14 +1126,22 @@ def _evaluate_ffm_snapshot(
     obs_grid_strides: Optional[Sequence[int]] = None,
     obs_grid_pool: bool = False,
 ):
-    """Evaluate one PointCloudFFM or FNOFFM snapshot.
+    """
+    Generalized single-snapshot evaluation for PointCloudFFM/FNOFFM across
+    regular and irregular datasets. Handles valid_sensor_mask for sparse
+    inversion (elasticity near-hole, airfoil near-surface) and body-polygon
+    overlay for airfoil plots.
 
     When ``n_ensemble > 1`` the rectified-flow ODE is integrated that many
-    times from independent priors. ``recon_phys`` and ``recon_std`` contain
-    the pointwise ensemble mean and standard deviation.
+    times from independent priors; reported ``recon_phys`` is the per-point
+    mean, ``recon_std`` is the per-point std (epistemic). Metrics and physics
+    quantities are evaluated on the ensemble mean so that single- and
+    multi-sample paths yield comparable numbers.
 
-    ``save_arrays_dir`` writes truth, reconstruction, uncertainty, sensor, and
-    mesh data for downstream physics visualizations.
+    When ``save_arrays_dir`` is set, a per-snapshot ``.npz`` is dumped with
+    every quantity downstream physics-visualization renderers need (truth /
+    recon / std / sensor indices / mesh metadata / body indices). This is
+    deliberately heavyweight — only enable when generating paper figures.
     """
     model.eval()
     if isinstance(cond_fields, int):
@@ -1139,13 +1199,14 @@ def _evaluate_ffm_snapshot(
         n_steps=n_steps,
         clamp_indices=obs_indices,
     )
-    # Pooled observations are block means: raw conditional sampling is the
-    # default; smooth endpoint guidance remains an explicit opt-in.
+    # Pooled observations are block means: default to raw conditional sampling
+    # and keep smooth Gaussian endpoint guidance as an explicit opt-in.
     obs_consistency_mode, obs_consistency_final_clamp = resolve_pooled_obs_consistency(
         obs_consistency_mode, obs_consistency_final_clamp, obs_grid_pool,
         context="_evaluate_ffm_snapshot")
 
-    # Forward optional controls only to samplers that declare them.
+    # Thread solver / obs-consistency controls only to samplers that accept
+    # them. Both FFM samplers now do; senseiver/geofno baselines may not.
     sig = inspect.signature(model.sample)
     if obs_grid_pool and "obs_consistency_mode" not in sig.parameters:
         raise ValueError(
@@ -1153,8 +1214,12 @@ def _evaluate_ffm_snapshot(
             "support (raw 'none' by default); this checkpoint's sampler has none.")
     if "ode_solver" in sig.parameters:
         sample_kwargs["ode_solver"] = ode_solver
-    # Active-emulsion control parameters (H, R, m) are known at inference and
-    # are forwarded only when the model was built to consume them.
+    # Generating PDE parameters (active_emulsion: H, R, m). Threaded only when BOTH the
+    # sampler accepts them and the dataset emits them, so baseline samplers
+    # (senseiver/geofno) and parameter-free datasets are untouched. These are known at
+    # inference: they are CONTROL parameters of the experiment, not measurements — you
+    # set the mean composition m when preparing the emulsion — so conditioning on them
+    # does not weaken a velocity-only sensing claim.
     if "params" in sig.parameters and model_uses_params(model):
         if "params" not in sample:
             raise RuntimeError(
@@ -1178,7 +1243,9 @@ def _evaluate_ffm_snapshot(
         recon_norm = recon[0]                          # [N, F]
         recon_norm_std = None
     else:
-        # A fixed per-snapshot seed makes ensemble outputs reproducible.
+        # Per-sample seeding so multiple --all-snapshots calls with the same
+        # K produce reproducible ensembles. The base seed (1234) is arbitrary
+        # but fixed so ensemble plots are diff-able across reruns.
         samples_norm = []
         for k in range(K):
             torch.manual_seed(1234 + snapshot_index * 977 + k)
@@ -1342,6 +1409,7 @@ def _evaluate_ffm_snapshot(
             truth_phys=truth_phys, recon_phys=recon_phys,
             recon_phys_std=recon_phys_std,
             obs_indices=obs_indices_cpu, obs_field_ids=obs_field_ids_cpu,
+            obs_coords=obs_coords_plot,
             field_names=field_names,
         )
 
@@ -1384,9 +1452,16 @@ def _dump_snapshot_arrays(out_path: Path, dataset, snapshot_index: int,
                           recon_phys: np.ndarray,
                           recon_phys_std: Optional[np.ndarray],
                           obs_indices: np.ndarray, obs_field_ids: np.ndarray,
-                          field_names) -> None:
-    """Persist snapshot arrays and dataset-specific mesh metadata."""
-    # ``coords_xy`` is the shared key for both 2D and 3D mesh coordinates.
+                          field_names, obs_coords: Optional[np.ndarray] = None) -> None:
+    """Persist per-snapshot arrays + dataset-specific mesh metadata.
+
+    The schema is intentionally flat (np.savez_compressed) so the
+    physics_metrics.py visualizers can pick exactly the keys they need
+    without depending on the dataset class itself.
+    """
+    # ``coords_xy`` is preserved as the key name even for 3-D car meshes
+    # (the array is (N, 2) for airfoil/elasticity, (N, 3) for car_cfd); the
+    # renderers read shape[1] to pick a 2-D or 3-D plotting path.
     payload = {
         "snapshot_index": np.int64(snapshot_index),
         "dataset": np.array(type(dataset).__name__),
@@ -1397,6 +1472,8 @@ def _dump_snapshot_arrays(out_path: Path, dataset, snapshot_index: int,
         "obs_indices": obs_indices.astype(np.int64),
         "obs_field_ids": obs_field_ids.astype(np.int64),
     }
+    if obs_coords is not None:
+        payload["obs_coords"] = np.asarray(obs_coords, dtype=np.float32)
     if recon_phys_std is not None:
         payload["recon_phys_std"] = recon_phys_std.astype(np.float32)
     if hasattr(dataset, "grid_shape") and getattr(dataset, "grid_shape", None) is not None:
@@ -1452,7 +1529,9 @@ def main():
     args = parse_args()
 
     demo_root = Path(args.demo_root).resolve()
-    # Without a dataset filter, search configuration backups across datasets.
+    # Backup configs live under Save_config/<dataset>/pointcloud_ffm/. If
+    # --dataset is omitted, search every dataset folder; the YAML's "dataset"
+    # field still selects the right run later.
     if args.dataset is not None:
         cfg_dir = demo_root / "Save_config" / args.dataset / "pointcloud_ffm"
     else:
@@ -1471,9 +1550,10 @@ def main():
         cfg["dataset"] = args.dataset
     cfg.setdefault("dataset", "turbulent_combustion")
 
-    # A resumed submission may archive a newer YAML while continuing the
-    # original timestamped run. Resolve the active run first, then rebuild from
-    # its effective args.json.
+    # RELOAD submissions archive a fresh YAML but continue writing the
+    # original timestamped run. Resolve the checkpoint first, then rebuild the
+    # model from that run's effective arguments instead of assuming that the
+    # newest YAML timestamp names a checkpoint directory.
     try:
         model_root = _find_latest_checkpoint_run(
             demo_root, cfg, args.Demo_Num, args.checkpoint)
@@ -1500,7 +1580,9 @@ def main():
         cfg["obs_grid_pool_physical"] = bool(args.obs_grid_pool_physical)
     cfg.setdefault("sensor_surface_offset_min", args.sensor_surface_offset_min)
     cfg.setdefault("sensor_surface_offset_max", args.sensor_surface_offset_max)
-    # An evaluation override replaces the configured sensor placement.
+    # Direct assignment, NOT setdefault: every airfoil_interp config already
+    # defines sensor_placement, so a setdefault override would silently no-op
+    # and the run would quietly evaluate at the trained placement.
     sensor_placement_trained = str(cfg.get("sensor_placement", "near_surface"))
     if args.sensor_placement is not None:
         cfg["sensor_placement"] = str(args.sensor_placement)
@@ -1541,7 +1623,7 @@ def main():
     except pickle.UnpicklingError:
         print("[Warning: !] Restricted torch.load failed; retrying with weights_only=False for a trusted local checkpoint.")
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-
+    
     state_dict = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
 
     # Some checkpoints may carry "_metadata" as a literal key after serialization.
@@ -1575,7 +1657,7 @@ def main():
         print('obs_grid_pool is on (mean-pooled coarse observation)\n')
 
     print(f'\nvis_n_obs_list is {vis_n_obs_list}\n')
-
+    
     n_steps_generation = (
         args.n_steps_generation if args.n_steps_generation is not None
         else cfg.get("n_steps_generation", 100)
@@ -1586,7 +1668,9 @@ def main():
     from datetime import datetime
     eval_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    # Sweep tags distinguish capped-subset runs from full comparisons.
+    # Robustness sweeps tag the eval dir so the sweep figure can group runs
+    # and the main comparison discovery (which requires all_snapshots) ignores
+    # the capped-subset sweep runs.
     _sweep = f"_{args.sweep_tag}" if args.sweep_tag else ""
     out_dir = (
         demo_root / "Save_reconstruction_files" / cfg["dataset"]
@@ -1616,8 +1700,9 @@ def main():
     def _run_snapshot(mode, sparse_condition, save_plots, file_tag, want_payload, arrays):
         """Dispatch one reconstruction through the dataset-appropriate path.
 
-        Both paths accept observation-consistency controls and a reusable
-        sparse condition, allowing mode comparisons on identical sensors.
+        Both paths now accept the obs_consistency_* controls, a reusable
+        sparse_condition, and return SenConsis metrics, so compare-modes can
+        sweep them on identical sensors.
         """
         if dataset_tag == "turbulent_combustion":
             return visualize_reconstruction(
@@ -1642,8 +1727,8 @@ def main():
                 obs_grid_pool=obs_grid_pool,
                 **obs_kwargs,
             )
-        # Irregular / sparse-inversion datasets (elasticity / airfoil /
-        # poisson) use the structured / body-polygon-aware plotting path.
+        # Other regular and irregular datasets use the unified structured /
+        # body-polygon-aware plotting path (including active emulsion).
         return _evaluate_ffm_snapshot(
             model=model, dataset=dataset, device=device,
             sensor_seed=args.sensor_seed,
@@ -1689,7 +1774,21 @@ def main():
         sparse_condition = None
         payload = None
         metrics = {}
-        for mode in args.obs_consistency_compare_modes:
+        requests_by_effective = {}
+        effective_modes = []
+        for requested_mode in args.obs_consistency_compare_modes:
+            effective_mode, _ = resolve_pooled_obs_consistency(
+                requested_mode, final_clamp, obs_grid_pool,
+                context="obs-consistency comparison")
+            requests_by_effective.setdefault(effective_mode, []).append(
+                requested_mode)
+            if effective_mode not in effective_modes:
+                effective_modes.append(effective_mode)
+        if len(effective_modes) < len(args.obs_consistency_compare_modes):
+            print("[*] Deduplicated observation-consistency comparison modes "
+                  f"after pooled resolution: {effective_modes}")
+
+        for mode in effective_modes:
             mode_metrics, mode_payload = _run_snapshot(
                 mode=mode,
                 sparse_condition=sparse_condition,
@@ -1711,6 +1810,7 @@ def main():
             metrics = mode_metrics
             comparison_rows.append({
                 "mode": mode,
+                "requested_modes": ",".join(requests_by_effective[mode]),
                 "relative_l2": _mean_full_field_relative_l2(mode_metrics),
                 "obs_rel_l2_SenConsis": mode_metrics.get("obs_rel_l2_SenConsis", float("nan")),
                 "obs_count_SenConsis_total": mode_metrics.get("obs_count_SenConsis_total", 0),
@@ -1859,7 +1959,9 @@ def main():
                     npz_path = out_dir / f"{prefix}_field_{name}_analysis.npz"
                     np.savez_compressed(npz_path, **analysis_payload)
 
-    # Benchmark sweeps vary NFE and sensor count.
+    # Benchmark sweeps: NFE (benchmark_n_steps) and sensor counts
+    # (benchmark_n_obs). Matches the sweep loop in train_latentfm_baseline.py
+    # (around line 600+) and evaluate_latentfm.py.
     benchmark_n_steps = (args.benchmark_n_steps
                          if args.benchmark_n_steps is not None
                          else cfg.get("benchmark_n_steps"))
@@ -1937,9 +2039,11 @@ def main():
                 obs_grid_pool=obs_grid_pool, **obs_kwargs,
             )
 
-    # The all-snapshots pass produces aggregate physics metrics and array dumps.
-    # Per-snapshot field plots are disabled; sensor-count and NFE sweeps use
-    # only the baseline snapshot.
+    # All-snapshots loop. Drives the test-set aggregates that the
+    # error-vs-distance-to-sensor and physics-metric distribution plots need.
+    # We deliberately skip per-snapshot scatter PNGs (write_field_plots=False)
+    # to keep the dump cheap — the renderers in physics_metrics.py read the
+    # arrays back. Sensor-count and NFE sweeps run only on the baseline snapshot.
     per_snapshot_metrics = None
     if args.all_snapshots and dataset_tag != "turbulent_combustion":
         per_snapshot_metrics = []
@@ -2021,7 +2125,8 @@ def main():
         "sensor_noise": float(args.sensor_noise),
         "max_snapshots": args.max_snapshots,
         "sweep_tag": args.sweep_tag,
-        # Record evaluation and training sensor placements separately.
+        # Placement provenance: the realized eval placement and the one the
+        # checkpoint was trained under. They differ on a deliberate override.
         "sensor_placement": str(cfg.get("sensor_placement", "near_surface")),
         "sensor_placement_trained": sensor_placement_trained,
         "ode_solver": ode_solver,
@@ -2034,6 +2139,8 @@ def main():
         "obs_consistency_schedule_power": float(args.obs_consistency_schedule_power),
         "obs_consistency_final_clamp": bool(summary_final_clamp),
         "obs_consistency_compare_modes": args.obs_consistency_compare_modes,
+        "obs_consistency_compare_modes_effective": (
+            list(metrics_by_mode) if metrics_by_mode is not None else None),
         "obs_grid_pool": bool(obs_grid_pool),
         "obs_grid_pool_physical": bool(
             getattr(dataset, "pool_observations_physical", False)),

@@ -36,7 +36,13 @@ def scatter_observed_values(
     obs_field_ids: torch.Tensor,
     strength: float = 1.0,
 ) -> torch.Tensor:
-    """Blend observed point/channel values into a cloned state tensor."""
+    """
+    Return a cloned tensor with observed point/channel entries blended in.
+
+    SenConsis means sensor consistency between generated values and sparse
+    observed values. This helper performs the pointwise sensor replacement used
+    by the default hard mode and by the final trusted-sensor clamp.
+    """
     out = x.clone()
     values = _obs_values_2d(obs_values).to(dtype=out.dtype)
     strength = float(strength)
@@ -144,8 +150,8 @@ def apply_endpoint_observation_consistency(
     Rectified-flow clean-endpoint observation masking.
 
     RF predicts v_theta(x_t, t, obs), so the clean endpoint estimate is
-    x1_hat = x_t + (1 - t) * v. The endpoint is blended toward sensor values
-    and converted back into a guided velocity.
+    x1_hat = x_t + (1 - t) * v. We mask that endpoint toward sensor values and
+    convert the consistent endpoint back into a guided velocity.
     """
     if t.ndim == 0:
         t = t.expand(x_t.shape[0])

@@ -12,7 +12,11 @@ try:
 except ImportError:
     NeuralOpFNO = None
 
-# KeOps is optional; unavailable installations use the torch neighbor backend.
+# pykeops is optional. The KeOps neighbor backend is faster on large M but
+# needs a CUDA toolchain at JIT-compile time; the existing fallback logic in
+# this file (e.g. ``if LazyTensor is None``) treats missing pykeops as an
+# implicit force to neighbor_backend='torch'. The import is guarded so that
+# environments without pykeops can still load Model.py and run the torch path.
 try:
     from pykeops.torch import LazyTensor
 except ImportError:
@@ -28,7 +32,9 @@ from obs_consistency import (
 
 FIELD_NAMES = ("CH4", "CO", "T", "U_1", "p")
 
-# Prior distributions.
+# ------------------------------
+# Prior distributions
+# ------------------------------
 class IIDGaussianPrior(nn.Module):
     """IID standard-normal prior on a point cloud."""
 
@@ -70,11 +76,15 @@ class RFFGaussianPrior(nn.Module):
         return torch.randn(*shape, device=device, dtype=dtype)
 
 
-# Deterministic Fourier positional encoding.
+# ------------------------------
+# Fourier positional encoding (deterministic, parameter-free)
+# ------------------------------
 class FourierPositionalEncoding(nn.Module):
-    """Encode coordinates with sine-cosine frequency bands.
+    """Sine-cosine frequency encoding for spatial coordinates (Senseiver-style).
 
-    The output dimension is ``2 * coord_dim * num_bands``.
+    Output dim = coord_dim * num_bands * 2. Used to give MLPs a high-frequency
+    input basis so they can resolve fine spatial structure without fighting
+    the NTK low-frequency bias.
     """
 
     def __init__(self, coord_dim: int, num_bands: int = 32, max_freq: float = 64.0):
@@ -92,7 +102,9 @@ class FourierPositionalEncoding(nn.Module):
         return enc.reshape(*coords.shape[:-1], self.out_dim)
 
 
-# MLP-RBF backbone.
+# ------------------------------
+# mlp_rbf backbone
+# ------------------------------
 def make_mlp(in_dim: int, hidden_dim: int, out_dim: int, depth: int = 3, act=nn.GELU) -> nn.Sequential:
     layers = []
     dim = in_dim
@@ -102,7 +114,9 @@ def make_mlp(in_dim: int, hidden_dim: int, out_dim: int, depth: int = 3, act=nn.
     layers.append(nn.Linear(dim, out_dim))
     return nn.Sequential(*layers)
 
-# GL-RBF gather helpers.
+# ------------------------------
+# for gathering in GL_rbf
+# ------------------------------
 def batched_gather_2d(x: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
     """
     Gather from x with shape [B, M] using idx with shape [B, N, K].
@@ -123,7 +137,11 @@ def batched_gather_3d(x: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
     return x[batch_idx, idx]
 
 class ConditionalPointFFM(nn.Module):
-    """Point-cloud backbone with field-aware sparse observations."""
+    """
+    Each observation carries its own field id through a learnable embedding, so
+    the model knows which physical quantity a sensor measures, not just where
+    it is (instead of one global cond_field_idx).
+    """
     def __init__(
         self,
         n_fields: int,
@@ -198,7 +216,17 @@ class ConditionalPointFFM(nn.Module):
 
 
 class ConditionalPointMLPRBF(nn.Module):
-    """MLP backbone with RBF sensor aggregation and global pooling."""
+    """
+    Baseline backbone:
+      - per-query-point MLP encoder
+      - sensor token encoder
+      - RBF-weighted local sensor aggregation
+      - one global pooled feature
+      - pointwise velocity head
+
+    Kept under its own name so it can be compared directly against the
+    Perceiver backbone.
+    """
     def __init__(
         self,
         n_fields: int,
@@ -273,7 +301,9 @@ class ConditionalPointMLPRBF(nn.Module):
         return self.head(torch.cat([point_feat, global_feat, local_cond], dim=-1))
 
 
-# Perceiver backbone.
+# ------------------------------
+# Perceiver backbone
+# ------------------------------
 class FeedForward(nn.Module):
     """
     Standard Transformer feed-forward block used after attention.
@@ -376,7 +406,20 @@ class SelfAttentionBlock(nn.Module):
 
 
 class ConditionalPointPerceiver(nn.Module):
-    """Perceiver backbone for conditional point-cloud velocity prediction."""
+    """
+    Perceiver-style backbone for conditional point-cloud velocity prediction.
+
+    High-level flow:
+      1) Build query-state tokens from (coords, x_t, t)
+      2) Build sparse sensor tokens from (obs_coords, obs_values, obs_field_ids)
+      3) Concatenate them into one input token set
+      4) Cross-attend a small learned latent array to the full token set
+      5) Process latents with several self-attention blocks
+      6) Decode per-point velocity from the latents using output query tokens
+
+    This keeps the external forward signature identical to the existing backbone,
+    so the outer flow / RF wrapper does not need to change.
+    """
     def __init__(
         self,
         n_fields: int,
@@ -558,7 +601,7 @@ class ConditionalPointPerceiver(nn.Module):
             kv_padding_mask=kv_padding_mask,
         )
 
-        # Continue processing in latent space.
+        # Process only in latent space from now on.
         for block in self.latent_blocks:
             latents = block(latents)
 
@@ -571,7 +614,10 @@ class ConditionalPointPerceiver(nn.Module):
         x_t: torch.Tensor,
         coords: torch.Tensor,
     ) -> torch.Tensor:
-        """Decode pointwise outputs in bounded-size query chunks."""
+        """
+        Decode per-point outputs in chunks to reduce memory during full-resolution reconstruction. 
+        Training usually uses a smaller n_query_points and may not need chunking, but reconstruction on all ~40k points can benefit from it.
+        """
         n_pts = coords.shape[1]
 
         if self.decode_chunk_size is None or n_pts <= self.decode_chunk_size:
@@ -629,13 +675,35 @@ class ConditionalPointPerceiver(nn.Module):
         )
 
 
-# Global-local backbone.
+# ------------------------------
+# Global-Local backbone
+# ------------------------------
 class ConditionalPointHybridLocalGlobalRBF(nn.Module):
-    """Hybrid latent-global and RBF-local point-cloud backbone.
+    """
+    Hybrid local-global backbone for conditional point-cloud FFM.
 
-    Sensor tokens are encoded through latent attention and gathered at query
-    points with dense or top-k RBF variants. Neighbor search supports torch and
-    optional KeOps backends.
+    Pipeline:
+      1) Build sparse sensor tokens from (obs_coords, obs_values, obs_field_ids).
+      2) A learned latent array cross-attends to the sensor tokens (global encoding).
+      3) The sensor tokens cross-attend back to the processed latents, yielding
+         globally enriched local sensor tokens.
+      4) Gather the enriched sensor tokens to arbitrary query points. Gather modes:
+           - "rbf": dense RBF distance-based aggregation over all sensors.
+           - "topk_rbf": RBF aggregation over the k nearest sensors.
+           - "topk_rbf_gate": top-k RBF modulated by a learned query-sensor content gate.
+           - "topk_rbf_ptlocal": top-k RBF after Point-Transformer-style local
+             refinement on the sensor graph.
+      5) Extract a global summary from the latents ('cls' or 'mean') and concatenate
+         it separately to every query point. The summary token has no coordinates,
+         so it is used only as a global feature, never as a spatial sensor.
+
+    Backends:
+      - neighbor_backend: "torch" (dense pairwise matrices) or "keops" (LazyTensors).
+      - The keops backend avoids the O(B * N * M) pairwise-distance memory cost
+        (O(N + M) instead), so large point clouds usually do not need
+        'gather_query_chunk_size' loops.
+      - Inputs to KeOps routines are made `.contiguous()` to avoid silent
+        reallocation in the C++ backend.
     """
     def __init__(
         self,
@@ -672,7 +740,7 @@ class ConditionalPointHybridLocalGlobalRBF(nn.Module):
         pe_num_bands: int = 32,
         pe_max_freq: float = 64.0,
 
-        # Enhanced GL-RBF options.
+        # -------- Enhanced backbone (GL_rbf_ENH) options --------
         enhanced_backbone: bool = False,
         sensor_coord_encoding: str = "raw",
         latent_sensor_reinject: bool = False,
@@ -683,7 +751,7 @@ class ConditionalPointHybridLocalGlobalRBF(nn.Module):
         enhanced_head_norm: bool = False,
         glres_scale_init: float = 0.0,
 
-        # Generating-parameter conditioning.
+        # -------- Generating-PDE-parameter conditioning (opt-in; see _encode_params) --------
         n_params: int = 0,                                   # 0 disables the whole path
         param_log_mask: Optional[Sequence[bool]] = None,
         param_mu: Optional[Sequence[float]] = None,
@@ -803,7 +871,7 @@ class ConditionalPointHybridLocalGlobalRBF(nn.Module):
         if self.gather_mode == "rbf": print(f"\nThe gather mode is {gather_mode} as default choice.\n")
         else: print(f"\nNOTICE: The gather mode is {gather_mode} with top-k {gather_topk} !!!\n")
 
-        # Build the query-side gate only for gated aggregation.
+        # Only build the heavy query-side gate when the gate mode is actually selected.
         if self.gather_mode == "topk_rbf_gate":
             self.query_to_cond = nn.Linear(hidden_dim, cond_dim, bias=False)
 
@@ -817,9 +885,16 @@ class ConditionalPointHybridLocalGlobalRBF(nn.Module):
 
         if self.gather_topk < 1:
             raise ValueError(f"gather_topk must be >= 1, got {self.gather_topk}")
-        # Optional learnable locality scale.
+        # Optional learnable locality scale
         if learnable_rbf_sigma:
-            self.log_rbf_sigma = nn.Parameter(torch.log(torch.tensor(float(rbf_sigma))))
+            # Keep the historical scalar parameter shape. Fieldwise mode learns
+            # one global multiplier while preserving the physically specified
+            # per-field ratios.
+            self.log_rbf_sigma = nn.Parameter(
+                torch.log(torch.tensor(float(rbf_sigma))))
+        # else:
+        #     self.register_buffer("_fixed_rbf_sigma", torch.tensor(float(rbf_sigma)))
+        #     self.log_rbf_sigma = None
 
         self.sensor_local_topk = int(sensor_local_topk)
         self.sensor_local_dropout_p = float(sensor_local_dropout)
@@ -827,7 +902,13 @@ class ConditionalPointHybridLocalGlobalRBF(nn.Module):
         if self.sensor_local_topk < 1:
             raise ValueError(f"sensor_local_topk must be >= 1, got {self.sensor_local_topk}")
 
-        # Fourier features do not affect coordinate-space neighbor distances.
+        # -------------------------
+        # Optional Fourier positional encoding for the encoder inputs.
+        # PE is feature-only: the RBF gather (and any sensor-local KNN)
+        # consumes model coordinates directly, with only explicitly configured
+        # periodic axes wrapped by the minimum-image convention. Default off
+        # preserves checkpoint compatibility for models trained on raw coords.
+        # -------------------------
         self.use_fourier_pe = bool(use_fourier_pe)
         if self.use_fourier_pe:
             self.pos_enc = FourierPositionalEncoding(
@@ -841,7 +922,7 @@ class ConditionalPointHybridLocalGlobalRBF(nn.Module):
             coord_feat_dim = coord_dim
         self.coord_feat_dim = coord_feat_dim
 
-        # Enhanced options default to the base checkpoint schema.
+        # GL_rbf_ENH options default off for checkpoint compatibility.
         self.enhanced_backbone = bool(enhanced_backbone)
         self.sensor_coord_encoding = sensor_coord_encoding
         self.latent_sensor_reinject = bool(latent_sensor_reinject)
@@ -1132,10 +1213,23 @@ class ConditionalPointHybridLocalGlobalRBF(nn.Module):
         return self.summary_proj(summary)    # [B, H]
 
     def _encode_params(self, params: torch.Tensor) -> torch.Tensor:
-        """Encode raw physical parameters as ``[B, hidden_dim]`` features.
+        """Raw physical parameters [B, n_params] -> a [B, hidden_dim] embedding.
 
-        Log-scaled slots are transformed and standardized before optional
-        training jitter, slot dropout, and Fourier encoding.
+        Steps, in order (the transform must mirror
+        helpers.ActiveEmulsionDataset._param_transform_np, or the mu/sigma buffers
+        baked into a checkpoint standardize the wrong quantity):
+
+          1. log10 on the slots flagged by param_log_mask (H, R span decades).
+          2. Standardize with the train-split mu/sigma carried as buffers.
+          3. Train only: vicinal jitter. The sweep has 21x7x4 grid values and the
+             splits are cell-level, so without it the model sees 588 label spikes and
+             can key a lookup table on them; the jitter turns them into a continuum.
+             Same fix as the continuous-conditional generative literature (CcGAN /
+             CCDM), where few-samples-per-label is the defining problem.
+          4. Train only: independent per-slot dropout to a learned null token, so
+             the model can run on any known subset at inference.
+          5. Low-order Fourier features. Deliberately few (param_n_freq=4): enough to
+             let the MLP separate nearby values, too few to index 588 cells.
         """
         if self.n_params <= 0:
             raise RuntimeError("_encode_params called on a model built with n_params=0")
@@ -1167,7 +1261,9 @@ class ConditionalPointHybridLocalGlobalRBF(nn.Module):
         return self.param_mlp(torch.cat(feats, dim=-1))          # [B, hidden_dim]
 
     def null_param_embedding(self, bsz: int, device=None, dtype=None) -> torch.Tensor:
-        """Return the embedding used when all parameter slots are unknown."""
+        """The fully-unknown-parameter embedding, for the null arm of the conditioning
+        diagnostics (how far the conditioned velocity field is from the unconditioned
+        one) and for classifier-free guidance if it is ever wanted."""
         z = self.param_null.expand(bsz, self.n_params)
         feats = [z]
         if self.param_n_freq > 0:
@@ -1333,8 +1429,9 @@ class ConditionalPointHybridLocalGlobalRBF(nn.Module):
         """
 
         # Distance search must remain finite for explicit half-precision
-        # coordinates. Both the 1e6 invalid-slot sentinel and squared
-        # distances can overflow fp16.
+        # coordinates.  Both the 1e6 invalid-slot sentinel and squared
+        # distances can overflow fp16; AMP normally leaves coordinates in
+        # fp32, but promoting here also makes direct ``model.half()`` safe.
         obs_coords_out = obs_coords
         distance_dtype = query_coords.dtype
         if distance_dtype in (torch.float16, torch.bfloat16):
@@ -1427,12 +1524,19 @@ class ConditionalPointHybridLocalGlobalRBF(nn.Module):
         sensor_feat: torch.Tensor,        # [B, M, Cc]
         obs_mask: torch.Tensor,           # [B, M]
     ) -> torch.Tensor:
-        """Refine sensor tokens over a local Point-Transformer graph.
-
-        Neighbor search requests one extra entry and removes the sensor's own
-        entry before attention.
         """
-        # Search one extra neighbor and discard the self-neighbor.
+        Point-Transformer-style local refinement on the sensor graph.
+
+        - This operates on M sensors, not N query points, so its memory cost is much
+          smaller than query-side gating.
+        - It gives each refined sensor token awareness of its local sensor neighborhood
+          before the final query-side top-k RBF gather.
+
+        Implementation notes:
+        - Uses the existing neighbor backend (torch / keops) through _get_topk_neighbors.
+        - Uses K+1 neighbors and drops the first one, which is usually the sensor itself.
+        """
+        # Search one extra neighbor so we can discard self-neighbor.
         k_search = min(self.sensor_local_topk + 1, sensor_coords.shape[1])
 
         nbr_d2, nbr_feat, nbr_coords, nbr_valid = self._get_topk_neighbors(
@@ -1481,7 +1585,10 @@ class ConditionalPointHybridLocalGlobalRBF(nn.Module):
         point_feat: torch.Tensor,
         coords: torch.Tensor,
     ) -> torch.Tensor:
-        """Build point- or coordinate-based latent readout tokens."""
+        """
+        Build query tokens for the latent readout, either from the current point
+        features ("point") or from Senseiver-style coordinate decoder tokens ("coord").
+        """
         if self.query_readout_type == "coord":
             bsz, n_query, _ = coords.shape
             coord_feat = (self.pos_enc(self._positional_coordinates(coords))
@@ -1496,7 +1603,11 @@ class ConditionalPointHybridLocalGlobalRBF(nn.Module):
         coords: torch.Tensor,
         latents: torch.Tensor,
     ) -> torch.Tensor:
-        """Read query-global features from latents in bounded-size chunks."""
+        """
+        Query-to-latent readout in chunks. This is O(B * N * L), avoiding query-sensor
+        [B, N, K, C] feature materialization. Shared by gather_mode == "topk_rbf_glres"
+        and the enhanced query_latent_readout path.
+        """
         n_query = point_feat.shape[1]
         chunk_size = self.gather_query_chunk_size
         if chunk_size is None and n_query > 4096:
@@ -1520,7 +1631,10 @@ class ConditionalPointHybridLocalGlobalRBF(nn.Module):
         point_feat: torch.Tensor,
         global_feat: torch.Tensor,
     ) -> torch.Tensor:
-        """Predict the FiLM-conditioned coarse field for global-residual gather."""
+        """
+        Summary-driven pointwise coarse prediction (FiLM). Used only in
+        gather_mode == "topk_rbf_glres".
+        """
         gamma, beta = self.coarse_film(global_feat).chunk(2, dim=-1)
         coarse_feat = (
             point_feat * (1.0 + torch.tanh(gamma).unsqueeze(1))
@@ -1634,8 +1748,12 @@ class ConditionalPointHybridLocalGlobalRBF(nn.Module):
                     logits = logits + self.gather_gate(gate_in).squeeze(-1)
 
                 # Deliberately omit topk_rbf_glres's learned per-sensor logit
-                # bias here. Fieldwise mode keeps the local weights purely
-                # geometric; glres retains its global residual paths.
+                # bias here. In a mixed-resolution field it can overpower the
+                # pitch-matched Gaussian and collapse interpolation back toward
+                # individual/Voronoi sensors. Fieldwise mode keeps the local
+                # weights purely geometric; glres still retains its query-latent
+                # readout and smooth global coarse residual.
+
                 weights = self._masked_neighbor_softmax(logits, topk_valid)
                 local = torch.sum(
                     weights.unsqueeze(-1) * topk_sensor_feat, dim=2).to(
@@ -1645,7 +1763,8 @@ class ConditionalPointHybridLocalGlobalRBF(nn.Module):
             field_features.append(local)
             field_present.append(present)
 
-        # Missing fields remain zero and are excluded from the balanced mean.
+        # [B, N, F, C]. Missing fields remain zero and are excluded from the
+        # balanced initialization path.
         stacked = torch.stack(field_features, dim=2)
         present = torch.stack(field_present, dim=1)
         denom = present.sum(dim=1).clamp_min(1).to(stacked.dtype)
@@ -1677,7 +1796,7 @@ class ConditionalPointHybridLocalGlobalRBF(nn.Module):
 
         sigma = torch.exp(self.log_rbf_sigma).clamp_min(1e-6) if self.learnable_rbf_sigma else self.rbf_sigma
 
-        # Full RBF gather.
+        # Default: full RBF gather
         if self.gather_mode == "rbf":
             if self._use_keops():
                 return self._aggregate_rbf_keops(
@@ -1703,7 +1822,7 @@ class ConditionalPointHybridLocalGlobalRBF(nn.Module):
                 refined_sensor_feat.to(weights.dtype)).to(
                     refined_sensor_feat.dtype)
 
-        # Top-k gather modes.
+        # top-k modes
         k = min(self.gather_topk, obs_coords.shape[1])
 
         topk_d2, topk_sensor_feat, topk_sensor_coords, topk_valid = self._get_topk_neighbors(
@@ -1824,13 +1943,15 @@ class ConditionalPointHybridLocalGlobalRBF(nn.Module):
                 f"this model was built with n_params={self.n_params} and needs params "
                 "on every call; got None.")
 
-        # Query-point features.
+        # Query-point features
         t_feat = t.view(bsz, 1, 1).expand(bsz, n_pts, 1)
         coord_feat = (self.pos_enc(self._positional_coordinates(coords))
                       if self.use_fourier_pe else coords)
         point_feat = self.point_encoder(torch.cat([coord_feat, x_t, t_feat], dim=-1))  # [B, N, H]
 
-        # Local sensor tokens.
+        # -------------------------
+        # Local sensor tokens
+        # -------------------------
         sensor_tokens = self._build_sensor_tokens(
             obs_coords=obs_coords,
             obs_values=obs_values,
@@ -1838,20 +1959,25 @@ class ConditionalPointHybridLocalGlobalRBF(nn.Module):
             obs_field_ids=obs_field_ids,
         )  # [B, M, D]
 
-        # Global latent processing.
+        # -------------------------
+        # Global latent processing
+        # -------------------------
         latents = self._encode_latents(sensor_tokens=sensor_tokens, obs_mask=obs_mask)  # [B, L, D]
 
-        # Refine sensor tokens against latent memory.
+        # -------------------------
+        # Double-dip refinement:
+        # sensor tokens query back into the latent memory
+        # -------------------------
         refined_sensor_tokens = self.sensor_back_attn(
             q=sensor_tokens,
             kv=latents,
             kv_padding_mask=None,
         )  # [B, M, D]
 
-        # Clear padded sensor rows after attention.
+        # Zero out padded sensor rows again after attention
         refined_sensor_tokens = refined_sensor_tokens * obs_mask.unsqueeze(-1)
 
-        # Project refined sensor tokens to the local conditioning width.
+        # Project refined sensor tokens to the local conditioning width
         refined_sensor_feat = self.sensor_out_proj(refined_sensor_tokens)   # [B, M, cond_dim]
         refined_sensor_feat = refined_sensor_feat * obs_mask.unsqueeze(-1)
 
@@ -1866,9 +1992,12 @@ class ConditionalPointHybridLocalGlobalRBF(nn.Module):
         else:
             global_for_head = global_feat.unsqueeze(1).expand(bsz, n_pts, -1)  # [B, N, H]
 
-        # Global-residual gather.
+        # -------------------------
+        # Global-residual gather (topk_rbf_glres)
+        # -------------------------
         if self.gather_mode == "topk_rbf_glres":
-            # Local top-k gather (sensor-importance bias is applied inside _aggregate_chunk).
+            # Local top-k gather. Legacy mode applies learned sensor importance;
+            # fieldwise mode intentionally keeps its local RBF purely geometric.
             local_cond = self.aggregate_sparse_obs(
                 query_coords=coords,
                 query_feat=point_feat,
@@ -1878,7 +2007,7 @@ class ConditionalPointHybridLocalGlobalRBF(nn.Module):
                 obs_field_ids=obs_field_ids,
             )  # [B, N, cond_dim]
 
-            # Add a learned coarse residual from the global summary.
+            # Summary-driven coarse scaffold, added as a learnable residual.
             coarse_pred = self.coarse_scale * self._predict_global_coarse(point_feat, global_feat)
 
             head_in = torch.cat([point_feat, global_for_head, local_cond], dim=-1)
@@ -1892,7 +2021,9 @@ class ConditionalPointHybridLocalGlobalRBF(nn.Module):
                 sensor_feat=refined_sensor_feat,
                 obs_mask=obs_mask,)
 
-        # Gather sensor features at query points.
+        # -------------------------
+        # Gather back to queries
+        # -------------------------
         local_cond = self.aggregate_sparse_obs(
             query_coords=coords,
             query_feat=point_feat,
@@ -1902,7 +2033,9 @@ class ConditionalPointHybridLocalGlobalRBF(nn.Module):
             obs_field_ids=obs_field_ids,
         )  # [B, N, cond_dim]
 
-        # Final velocity prediction.
+        # -------------------------
+        # Final velocity prediction
+        # -------------------------
         head_in = torch.cat([point_feat, global_for_head, local_cond], dim=-1)
         out = self.head(self.head_in_norm(head_in))
         return out
@@ -1913,6 +2046,7 @@ class FNO(nn.Module):
     """Regular-grid FNO with rasterized sparse conditioning.
 
     Inputs use point layout and are permuted to row-major grids internally.
+    Three conditioning-channel groups make earlier two-group checkpoints incompatible.
     """
 
     def __init__(
@@ -1951,7 +2085,8 @@ class FNO(nn.Module):
                 f"condition_blur_sigma must be > 0, got {self.condition_blur_sigma}."
             )
 
-        # Non-persistent caches are rebuilt after loading or device changes.
+        # Keep the blur kernel off the persistent state dict so old checkpoints
+        # still load with strict=True.
         self.register_buffer("_condition_blur_kernel_cache", torch.empty(0), persistent=False)
         self.register_buffer("_grid_order_cache", torch.empty(0, dtype=torch.long), persistent=False)
         self.register_buffer("_point_to_grid_cache", torch.empty(0, dtype=torch.long), persistent=False)
@@ -1979,12 +2114,15 @@ class FNO(nn.Module):
         coords: torch.Tensor,
         decimals: int = 6,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Return maps between dataset point order and row-major grid order.
+        """
+        Return index maps between the dataset point order and row-major grid order.
 
         grid_order[g] = original point index for row-major grid cell g.
         point_to_grid[p] = row-major grid cell for original point index p.
 
-        The non-persistent cache assumes a fixed mesh for each model instance.
+        The cache assumes the FNO sees one fixed mesh, which is true for this
+        turbulent-combustion demo. It is non-persistent and rebuilt after device
+        moves or checkpoint loading.
         """
         n_pts = coords.shape[1]
         expected = self.Num_x * self.Num_y
@@ -2246,31 +2384,56 @@ class FNO(nn.Module):
 
 
 
-# Flow-model wrappers.
+# Model wrappers --------------------------------------
+
+# Wrapper for Point-Cloud-Based models
 class PointCloudFFM(nn.Module):
-    """Rectified-flow wrapper for point-cloud velocity models."""
+    """
+    1-Rectified Flow wrapper (replaces the earlier noisy Functional Flow
+    Matching bridge).
+
+    Core 1-RF idea (https://github.com/gnobitab/RectifiedFlow):
+        1) Draw a source sample x0 ~ prior
+        2) Draw a target sample x1 from data
+        3) Interpolate linearly: x_t = (1 - t) * x0 + t * x1
+        4) Train the velocity model to predict the constant displacement x1 - x0
+    """
     def __init__(self, model: nn.Module, prior: nn.Module, sigma_min: float = 1e-4):
         super().__init__()
         self.model = model
         self.prior = prior
 
-        # Stored for checkpoint and configuration compatibility.
+        # Unused in 1-RF; kept so old checkpoints and YAML files still load.
         self.sigma_min = sigma_min
 
     def sample_source(self, coords: torch.Tensor) -> torch.Tensor:
-        """Draw the rectified-flow source endpoint from the configured prior."""
+        """
+        Draw a source sample x0 from the chosen prior on the query coordinates.
+        This is the pi_0 endpoint in rectified flow.
+        """
         return self.prior(coords, self.model.n_fields)
 
     def simulate(self, t: torch.Tensor, x0: torch.Tensor, x1: torch.Tensor) -> torch.Tensor:
-        """Interpolate as ``x_t = (1 - t) * x0 + t * x1``."""
+        """
+        Straight-line interpolation between source x0 and target x1.
+
+        x_t = (1 - t) * x0 + t * x1
+        """
         alpha = t.view(-1, 1, 1)
+        # print(f'alpha.shape: {alpha.shape}')
+        # print(f'x0.shape: {x0.shape}')
+        # print(f'x1.shape: {x1.shape}')
         return (1.0 - alpha) * x0 + alpha * x1
 
     def target_vector_field(self, x0: torch.Tensor, x1: torch.Tensor) -> torch.Tensor:
-        """Return the rectified-flow target velocity ``x1 - x0``."""
+        """
+        1-RF target velocity is the constant straight-line displacement.
+
+        v*(x_t, t) = x1 - x0
+        """
         return x1 - x0
 
-    def training_loss(
+    def rf_terms(
         self,
         x1: torch.Tensor,
         coords: torch.Tensor,
@@ -2278,10 +2441,19 @@ class PointCloudFFM(nn.Module):
         obs_values: torch.Tensor,
         obs_mask: torch.Tensor,
         obs_field_ids: torch.Tensor,
-        obs_indices: Optional[torch.Tensor] = None,
         *,
         params: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Draw one rectified-flow tuple and predict its velocity.
+
+        SINGLE SOURCE for the RF regression: ``training_loss`` (training and
+        deterministic validation) and the post-training data/anchor
+        constraints (``data_and_anchor_losses``) all call this, so their data
+        losses are the same computation by construction and consume the RNG
+        stream in the same order — congruence is structural, not a comment.
+
+        Returns ``(t, x_t, target, pred)``; the caller reduces to a loss.
+        """
         # Sample x0 from the source prior for the current query coordinates.
         x0 = self.sample_source(coords)
 
@@ -2295,7 +2467,24 @@ class PointCloudFFM(nn.Module):
 
         # Predict the velocity under sparse conditioning.
         pred = self.model(t, x_t, coords, obs_coords, obs_values, obs_mask, obs_field_ids,
-                          params=params)
+                          **({} if params is None else {"params": params}))
+        return t, x_t, target, pred
+
+    def training_loss(
+        self,
+        x1: torch.Tensor,
+        coords: torch.Tensor,
+        obs_coords: torch.Tensor,
+        obs_values: torch.Tensor,
+        obs_mask: torch.Tensor,
+        obs_field_ids: torch.Tensor,
+        obs_indices: Optional[torch.Tensor] = None,
+        *,
+        params: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        _, _, target, pred = self.rf_terms(
+            x1, coords, obs_coords, obs_values, obs_mask, obs_field_ids,
+            params=params)
 
         # Standard supervised regression loss used in 1-RF.
         loss = F.mse_loss(pred, target)
@@ -2324,10 +2513,18 @@ class PointCloudFFM(nn.Module):
         obs_consistency_chunk_size: int = 8192,
         params: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Integrate the rectified-flow ODE from the source prior.
+        """
+        Integrate the learned rectified-flow ODE from x0 ~ prior to x1.
 
-        ``params`` contains raw physical generating parameters and is required
-        when the backbone was configured with parameter conditioning.
+        Euler is the default solver because low-step Euler is the main use case
+        for 1-RF. Heun is kept as an optional baseline / sanity check.
+
+        params: [B, n_params] raw physical generating parameters, required iff the
+        backbone was built with n_params > 0. Not keyword-only here, unlike forward()
+        and training_loss(): evaluate_ffm.py discovers optional sampler controls with
+        inspect.signature(model.sample) and passes them as kwargs, so a normal
+        parameter is picked up automatically while samplers that lack it
+        (senseiver/geofno baselines) are left untouched.
         """
         if n_steps < 1:
             raise ValueError(f"n_steps must be >= 1, got {n_steps}")
@@ -2409,7 +2606,8 @@ class PointCloudFFM(nn.Module):
                 # Default 1-RF benchmark solver.
                 x = x + dt * v0
 
-            # Hard consistency replaces observed entries after each step.
+            # default_hard preserves the previous per-step pointwise sensor
+            # replacement behavior for SenConsis.
             if obs_consistency_mode == "default_hard" and clamp_indices is not None:
                 x = scatter_observed_values(
                     x=x,
@@ -2432,10 +2630,15 @@ class PointCloudFFM(nn.Module):
 
         return x
 
+# Wrapper for FNO
 class FNOFFM(PointCloudFFM):
-    """Rectified-flow wrapper for a full-grid FNO backbone.
+    """
+    This wrapper keeps the same outer FFM objective as PointCloudFFM but
+    requires the full regular grid during both training and sampling, because
+    the FNO backbone reshapes [B, N, C] into [B, C, Num_y, Num_x].
 
-    ``obs_indices`` rasterizes sparse measurements into grid channels.
+    The generalized sparse-conditioning API is preserved, but obs_indices are
+    now mandatory so sparse measurements can be rasterized to grid channels.
     """
 
     def __init__(self, model: nn.Module, prior: nn.Module, sigma_min: float = 1e-4):
@@ -2452,7 +2655,10 @@ class FNOFFM(PointCloudFFM):
         obs_field_ids: torch.Tensor,
         obs_indices: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        """Compute rectified-flow loss with rasterized sparse sensors."""
+        """
+        RF training loss for the grid-based FNO backbone.
+        obs_indices are required so sparse sensors can be rasterized onto the grid.
+        """
         if obs_indices is None:
             raise ValueError("FNOFFM.training_loss requires obs_indices.")
 
@@ -2498,10 +2704,15 @@ class FNOFFM(PointCloudFFM):
         obs_consistency_final_clamp: bool = True,
         obs_consistency_chunk_size: int = 8192,
     ) -> torch.Tensor:
-        """Sample with FNO conditioning and optional observation clamping.
+        """
+        Guided sampling with the FNO backbone.
 
-        ``clamp_indices`` locates observations for rasterization and hard
-        consistency. Euler uses one evaluation per step and Heun uses two.
+        clamp_indices serves two roles here:
+          1) it tells the backbone where to rasterize sparse observations;
+          2) it is also used for hard clamping after each solver step.
+
+        Euler uses one model evaluation per step. Heun uses two. Keeping this
+        explicit is important for fair NFE comparisons against GL_rbf.
         """
         if n_steps < 1:
             raise ValueError(f"n_steps must be >= 1, got {n_steps}")
@@ -2619,9 +2830,29 @@ class FNOFFM(PointCloudFFM):
 
         return x
 
-# Compatibility implementation of the base hybrid GL-RBF backbone.
+# -----------------------------------------------------
+# Backup copy of the pre-enhancement backbone, kept for reference.
+# -----------------------------------------------------
+
 class _ConditionalPointHybridLocalGlobalRBF(nn.Module):
-    """Base hybrid backbone with latent processing and RBF sensor gather."""
+    """
+    Hybrid local-global backbone for conditional point-cloud FFM.
+
+    Core idea:
+      1) Build sparse sensor tokens from (obs_coords, obs_values, obs_field_ids)
+      2) Let a learned latent array attend to those sensor tokens
+      3) Let the sparse sensor tokens attend back to the processed latents
+         ("double dip") to get globally enriched local sensor tokens
+      4) Gather those refined local sensor tokens to query points with the
+         same RBF distance-based aggregation used by the current baseline
+      5) Extract one global summary from the latent array and concatenate it
+         separately to every query point
+
+    Design choice:
+      - The latent summary / CLS-like token is not appended into the RBF gather.
+        It has no physical coordinates, so it is used as a separate global
+        feature rather than a fake spatial sensor.
+    """
     def __init__(
         self,
         n_fields: int,
@@ -2651,7 +2882,9 @@ class _ConditionalPointHybridLocalGlobalRBF(nn.Module):
         self.num_latents = num_latents
         self.summary_type = summary_type
 
-        # Point/query branch.
+        # -------------------------
+        # Point/query branch
+        # -------------------------
         # Query point token from [coords, x_t, t]
         self.point_encoder = make_mlp(
             in_dim=coord_dim + n_fields + 1,
@@ -2660,10 +2893,12 @@ class _ConditionalPointHybridLocalGlobalRBF(nn.Module):
             depth=3,
         )
 
-        # Sparse sensor branch.
+        # -------------------------
+        # Sparse sensor branch
+        # -------------------------
         self.field_embed = nn.Embedding(n_fields, field_embed_dim)
 
-        # Initial sensor token from position, value, and field embedding.
+        # Initial sparse sensor token from [obs_coords, obs_value, field_embed]
         self.sensor_in_proj = make_mlp(
             in_dim=coord_dim + 1 + field_embed_dim,
             hidden_dim=latent_dim,
@@ -2671,7 +2906,8 @@ class _ConditionalPointHybridLocalGlobalRBF(nn.Module):
             depth=3,
         )
 
-        # Project refined sensor tokens to the RBF conditioning width.
+        # Project the refined sensor tokens to the local conditioning width
+        # used by the RBF gather.
         self.sensor_out_proj = make_mlp(
             in_dim=latent_dim,
             hidden_dim=cond_dim,
@@ -2679,12 +2915,14 @@ class _ConditionalPointHybridLocalGlobalRBF(nn.Module):
             depth=2,
         )
 
-        # Latent global processor.
+        # -------------------------
+        # Latent global processor
+        # -------------------------
         self.latents = nn.Parameter(
             torch.randn(num_latents, latent_dim) / math.sqrt(latent_dim)
         )
 
-        # Latents attend to sparse sensor tokens.
+        # Latents attend to sparse sensor tokens
         self.input_cross_attn = CrossAttentionBlock(
             dim=latent_dim,
             num_heads=num_heads,
@@ -2693,7 +2931,7 @@ class _ConditionalPointHybridLocalGlobalRBF(nn.Module):
             mlp_dropout=mlp_dropout,
         )
 
-        # Process latents in latent space.
+        # Process latents in latent space
         self.latent_blocks = nn.ModuleList([
             SelfAttentionBlock(
                 dim=latent_dim,
@@ -2705,7 +2943,7 @@ class _ConditionalPointHybridLocalGlobalRBF(nn.Module):
             for _ in range(num_latent_blocks)
         ])
 
-        # Refine sensor tokens against the processed latents.
+        # Double-dip: refined local sensor tokens query the processed latents
         self.sensor_back_attn = CrossAttentionBlock(
             dim=latent_dim,
             num_heads=num_heads,
@@ -2714,7 +2952,7 @@ class _ConditionalPointHybridLocalGlobalRBF(nn.Module):
             mlp_dropout=mlp_dropout,
         )
 
-        # Project the latent summary to the global feature width.
+        # Separate projection for the latent summary used as a global feature
         self.summary_proj = make_mlp(
             in_dim=latent_dim,
             hidden_dim=hidden_dim,
@@ -2722,7 +2960,9 @@ class _ConditionalPointHybridLocalGlobalRBF(nn.Module):
             depth=2,
         )
 
-        # Final velocity head.
+        # -------------------------
+        # Final velocity head
+        # -------------------------
         self.head = nn.Sequential(
             nn.Linear(hidden_dim + hidden_dim + cond_dim, hidden_dim),
             nn.GELU(),
@@ -2740,7 +2980,12 @@ class _ConditionalPointHybridLocalGlobalRBF(nn.Module):
         obs_mask: torch.Tensor,
         obs_field_ids: torch.Tensor,
     ) -> torch.Tensor:
-        """Build sensor tokens from coordinates, values, and field embeddings."""
+        """
+        Build sparse sensor tokens from:
+          - sensor coordinates
+          - observed scalar value
+          - field identity embedding
+        """
         safe_field_ids = obs_field_ids.clamp_min(0)
         field_feat = self.field_embed(safe_field_ids)                 # [B, M, E]
         field_feat = field_feat * obs_mask.unsqueeze(-1)             # zero padded rows
@@ -2755,23 +3000,25 @@ class _ConditionalPointHybridLocalGlobalRBF(nn.Module):
         sensor_tokens: torch.Tensor,
         obs_mask: torch.Tensor,
     ) -> torch.Tensor:
-        """Encode sparse sensor tokens into the latent array."""
+        """
+        Let the learned latent array absorb and process the sparse sensor set.
+        """
         bsz = sensor_tokens.shape[0]
 
-        # Expand learned latents across the batch.
+        # Expand learned latents across the batch
         latents = self.latents.unsqueeze(0).expand(bsz, -1, -1)      # [B, L, D]
 
-        # True mask entries exclude padded tokens.
+        # key_padding_mask: True means "ignore this token"
         sensor_padding_mask = ~obs_mask.bool()
 
-        # Latents attend to sparse sensor tokens.
+        # Latents attend to sparse sensor tokens
         latents = self.input_cross_attn(
             q=latents,
             kv=sensor_tokens,
             kv_padding_mask=sensor_padding_mask,
         )
 
-        # Process in latent space.
+        # Process in latent space
         for block in self.latent_blocks:
             latents = block(latents)
 
@@ -2798,7 +3045,10 @@ class _ConditionalPointHybridLocalGlobalRBF(nn.Module):
         refined_sensor_feat: torch.Tensor,
         obs_mask: torch.Tensor,
     ) -> torch.Tensor:
-        """Gather refined sensor features at query points with RBF weights."""
+        """
+        Gather the globally enriched local sensor features back to query points
+        using the same RBF distance-based weighting as the original baseline.
+        """
         d2 = torch.cdist(query_coords, obs_coords, p=2.0) ** 2        # [B, N, M]
         large = torch.full_like(d2, 1e6)
         d2 = torch.where(obs_mask.unsqueeze(1) > 0, d2, large)
@@ -2823,11 +3073,15 @@ class _ConditionalPointHybridLocalGlobalRBF(nn.Module):
         """
         bsz, n_pts, _ = x_t.shape
 
-        # Query-point features.
+        # -------------------------
+        # Query-point features
+        # -------------------------
         t_feat = t.view(bsz, 1, 1).expand(bsz, n_pts, 1)
         point_feat = self.point_encoder(torch.cat([coords, x_t, t_feat], dim=-1))  # [B, N, H]
 
-        # Local sensor tokens.
+        # -------------------------
+        # Local sensor tokens
+        # -------------------------
         sensor_tokens = self._build_sensor_tokens(
             obs_coords=obs_coords,
             obs_values=obs_values,
@@ -2835,24 +3089,31 @@ class _ConditionalPointHybridLocalGlobalRBF(nn.Module):
             obs_field_ids=obs_field_ids,
         )  # [B, M, D]
 
-        # Global latent processing.
+        # -------------------------
+        # Global latent processing
+        # -------------------------
         latents = self._encode_latents(sensor_tokens=sensor_tokens, obs_mask=obs_mask)  # [B, L, D]
 
-        # Refine sensor tokens against latent memory.
+        # -------------------------
+        # Double-dip refinement:
+        # sensor tokens query back into the latent memory
+        # -------------------------
         refined_sensor_tokens = self.sensor_back_attn(
             q=sensor_tokens,
             kv=latents,
             kv_padding_mask=None,
         )  # [B, M, D]
 
-        # Clear padded sensor rows after attention.
+        # Zero out padded sensor rows again after attention
         refined_sensor_tokens = refined_sensor_tokens * obs_mask.unsqueeze(-1)
 
-        # Project refined sensor tokens to the local conditioning width.
+        # Project refined sensor tokens to the local conditioning width
         refined_sensor_feat = self.sensor_out_proj(refined_sensor_tokens)   # [B, M, cond_dim]
         refined_sensor_feat = refined_sensor_feat * obs_mask.unsqueeze(-1)
 
-        # Gather sensor features at query points.
+        # -------------------------
+        # RBF gather back to queries
+        # -------------------------
         local_cond = self.aggregate_sparse_obs(
             query_coords=coords,
             obs_coords=obs_coords,
@@ -2860,10 +3121,14 @@ class _ConditionalPointHybridLocalGlobalRBF(nn.Module):
             obs_mask=obs_mask,
         )  # [B, N, cond_dim]
 
-        # Global summary.
+        # -------------------------
+        # Separate global summary
+        # -------------------------
         global_feat = self._extract_global_summary(latents)                 # [B, H]
         global_feat = global_feat.unsqueeze(1).expand(bsz, n_pts, -1)      # [B, N, H]
 
-        # Final velocity prediction.
+        # -------------------------
+        # Final velocity prediction
+        # -------------------------
         out = self.head(torch.cat([point_feat, global_feat, local_cond], dim=-1))
         return out

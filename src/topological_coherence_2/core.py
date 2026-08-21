@@ -1,7 +1,21 @@
-"""Configured API for RCC8 profiles, losses, and visualizations.
+"""
+High-level API: the :class:`TopologicalCoherence` driver.
 
-Reference-derived thresholds are reused for prediction profiles. Batched
-``[B, C, H, W]`` input is supported.
+Wraps saliency -> profiles -> loss -> visualization into one configured object
+so callers do not have to thread the same hyperparameters through every call.
+A single instance fixes the saliency, quantiles, weighting, divergence and RCC
+tolerances used by :meth:`compute_profile`, :meth:`loss`, and the
+``visualize_*`` helpers.
+
+Batched data ``[B, C, H, W]`` is supported: :meth:`compute_profile` returns a
+list of profiles and :meth:`loss` averages the scalar loss across the batch.
+
+Key consistency rule
+--------------------
+Prediction and reference must be profiled with the same thresholds, otherwise
+their relation distributions are not comparable.  :meth:`loss` enforces this by
+deriving the thresholds from the *reference* saliency and passing them to the
+prediction's profile as ``user_thresholds``.
 """
 
 from __future__ import annotations
@@ -56,7 +70,7 @@ class TopologicalCoherence:
         self.dedupe_thresholds = dedupe_thresholds
         self.rcc_cfg = RCCConfig(eps_area=eps_area, connectivity=connectivity, eps=eps)
 
-    # Internal helpers.
+    # -- internal helpers -----------------------------------------------------
 
     def _names_for(self, c: int) -> List[str]:
         if self.field_names is not None:
@@ -76,7 +90,7 @@ class TopologicalCoherence:
             for ci in range(u.shape[0])
         }
 
-    # Public API.
+    # -- public API -----------------------------------------------------------
 
     def compute_profile(
         self,
@@ -138,7 +152,7 @@ class TopologicalCoherence:
         out["profile_ref"] = profile_ref
         return out
 
-    # Visualization shortcuts.
+    # -- visualization shortcuts ---------------------------------------------
 
     def visualize_pair_heatmap(self, path, profile: CoherenceProfile,
                                field_pair: Tuple[int, int], relation: str) -> None:
@@ -175,5 +189,5 @@ class TopologicalCoherence:
         )
 
     def thresholds_at_quantiles(self, u: np.ndarray) -> Dict[int, np.ndarray]:
-        """Return configured per-channel quantile thresholds."""
+        """Convenience: the per-channel threshold levels this config would use."""
         return self._thresholds_from(np.asarray(u))

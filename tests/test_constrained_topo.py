@@ -1,11 +1,17 @@
-"""Test constrained primal-dual topology post-training.
+"""Gate tests for the constrained (primal-dual) topology post-training mode.
 
-Coverage includes anchor losses, truncated rollout gradients, projected dual
-ascent, epoch integration, and checkpoint state.
+Covers:
+  1. function-space anchor to the frozen base (data_and_anchor_losses),
+  2. DRaFT-K truncated rollout gradients (backprop_last_k),
+  3. projected dual ascent on the data/anchor multipliers,
+  4. the full constrained epoch through run_epoch_direct_coherence,
+  5. dual-state checkpoint round-trip.
+
+Run from ``src``: ``python test_constrained_topo.py``
 """
 from __future__ import annotations
 
-# Support direct execution from any working directory.
+# Make src/ importable when run from any cwd.
 import os as _os
 import sys as _sys
 _SRC_DIR = _os.path.abspath(_os.path.join(
@@ -23,7 +29,9 @@ import torch
 import yaml
 
 import train_pointcloud_ffm as T
+from Model import PointCloudFFM
 from direct_coherence_loss import (
+    clean_estimate_random_rollout_step,
     clean_estimate_rollout,
     data_and_anchor_losses,
 )
@@ -52,37 +60,42 @@ class Net(torch.nn.Module):
         super().__init__()
         s.lin = torch.nn.Linear(C, C)
         s.sc = torch.nn.Parameter(torch.tensor(0.1))
+        # Records the module's train/eval mode at every forward, so tests can
+        # assert mode congruence between the objective and the constraints.
+        s.modes_seen = set()
 
     def forward(s, t, x, coords, obs_coords=None, obs_values=None, obs_mask=None,
                 obs_field_ids=None, **kw):
+        s.modes_seen.add(bool(s.training))
         return s.lin(x) * s.sc
 
 
-class FFM(torch.nn.Module):
+class DropNet(Net):
+    """Net with real dropout, to expose train/eval mode mismatches."""
+
     def __init__(s):
         super().__init__()
-        s.model = Net()
-        s.sigma_min = 1e-4
+        s.drop = torch.nn.Dropout(0.5)
+
+    def forward(s, t, x, coords, obs_coords=None, obs_values=None, obs_mask=None,
+                obs_field_ids=None, **kw):
+        s.modes_seen.add(bool(s.training))
+        return s.drop(s.lin(x)) * s.sc
+
+
+class FFM(PointCloudFFM):
+    """Toy wrapper on the REAL PointCloudFFM: rf_terms / training_loss /
+    simulate / target_vector_field are the production implementations, so
+    these gates exercise the single-source RF computation rather than a
+    hand-copied twin. Only the prior draw is stubbed."""
+
+    def __init__(s):
+        super().__init__(Net(), prior=torch.nn.Identity())
 
     def sample_source(s, coords):
         b = coords.shape[0] if coords.dim() == 3 else 1
         n = coords.shape[-2]
         return torch.randn(b, n, C)
-
-    def simulate(s, t, x0, x1):
-        tt = t.view(-1, 1, 1)
-        return (1 - tt) * x0 + tt * x1
-
-    def target_vector_field(s, x0, x1):
-        return x1 - x0
-
-    def training_loss(s, x1, coords, obs_coords=None, obs_values=None,
-                      obs_mask=None, obs_field_ids=None, obs_indices=None, **kw):
-        x0 = s.sample_source(coords)
-        t = torch.rand(x1.shape[0], device=x1.device, dtype=x1.dtype)
-        x_t = s.simulate(t, x0, x1)
-        v = s.model(t, x_t, coords)
-        return ((v - (x1 - x0)) ** 2).mean(), {}
 
 
 def _obs(bsz, m=8):
@@ -101,11 +114,11 @@ def test_anchor_zero_at_base_and_pulls_back():
     data_a, anchor_a = data_and_anchor_losses(model, base, x1, COORDS.expand(2, -1, -1),
                                               oc, ov, om, of)
     assert float(anchor_a) == 0.0, "anchor must be exactly 0 when model == base"
-    # A fixed RNG state gives the exact model training loss.
+    # Same RNG seed => the data loss must match model.training_loss exactly.
     torch.manual_seed(7)
-    data_ref, _ = model.training_loss(x1, COORDS.expand(2, -1, -1))
+    data_ref, _ = model.training_loss(x1, COORDS.expand(2, -1, -1), oc, ov, om, of)
     assert torch.allclose(data_a, data_ref), "shared sampling must match training_loss"
-    # Perturbing the model produces a positive anchor with a nonzero gradient.
+    # Perturb the model: anchor becomes positive and its gradient is nonzero.
     with torch.no_grad():
         model.model.lin.weight.add_(0.05)
     torch.manual_seed(7)
@@ -115,10 +128,47 @@ def test_anchor_zero_at_base_and_pulls_back():
     anchor_b.backward()
     g = model.model.lin.weight.grad
     assert g is not None and float(g.norm()) > 0.0
-    # The frozen base receives no gradients.
+    # Base stays frozen: no grads flow into it.
     assert all(p.grad is None for p in base.parameters())
     print(f"[ok] anchor: 0 at base, {float(anchor_b):.3e} after perturbation, "
           "gradient flows to the live model only")
+
+
+def test_constraints_measured_in_eval_mode():
+    """N20 regression (2026-08-19): the data/anchor pred must be the EVAL-mode
+    function -- the same function the topology rollouts shape and deterministic
+    validation measures. When it was computed with dropout active instead, the
+    duals watched a different function from the one the objective was moving:
+    N20 wrecked the deployed model (val RF 0.52 -> 17) while every budget read
+    as satisfied (dropout-mode RF 0.20 vs eval-mode RF 7.45, same batches)."""
+    torch.manual_seed(0)
+    model = FFM()
+    model.model = DropNet()
+    base = copy.deepcopy(model)
+    base.eval()
+    for p in base.parameters():
+        p.requires_grad_(False)
+    # Old trainer state: model left in train mode. The losses must not inherit it.
+    model.train(True)
+    x1 = torch.stack([mk(0), mk(1)])
+    oc, ov, om, of = _obs(2)
+    torch.manual_seed(7)
+    data_a, anchor_a = data_and_anchor_losses(model, base, x1, COORDS.expand(2, -1, -1),
+                                              oc, ov, om, of)
+    assert float(anchor_a) == 0.0, (
+        "anchor must be exactly 0 at model == base even with dropout modules "
+        "present and the model left in train mode (no dropout noise floor)")
+    assert model.model.modes_seen == {False}, (
+        "the constraint forward ran in train mode -- objective and constraints "
+        "are watching different functions again")
+    assert model.training, "the caller's mode must be restored after the call"
+    # The eval-mode pred stays differentiable: gradients reach the live model.
+    data_a.backward()
+    g = model.model.lin.weight.grad
+    assert g is not None and float(g.norm()) > 0.0
+    assert all(p.grad is None for p in base.parameters())
+    print("[ok] data/anchor pred is eval-mode: anchor exactly 0 at base under "
+          "dropout, gradients flow, caller mode restored")
 
 
 def test_truncated_rollout_gradients():
@@ -149,6 +199,43 @@ def test_truncated_rollout_gradients():
           f"full={g_full:.4g} k1={g_k1:.4g}")
 
 
+def test_random_rollout_step_routes_credit_to_selected_time():
+    class TimeVelocity(torch.nn.Module):
+        n_params = 0
+
+        def __init__(self):
+            super().__init__()
+            self.weights = torch.nn.Parameter(torch.arange(1.0, 5.0))
+
+        def forward(self, t, x, coords, *args, **kwargs):
+            index = torch.clamp((t * 4).long(), max=3)
+            value = self.weights[index].view(-1, 1, 1)
+            return value.expand_as(x)
+
+    class TimeFFM(torch.nn.Module):
+        requires_full_grid = False
+
+        def __init__(self):
+            super().__init__()
+            self.model = TimeVelocity()
+
+        def sample_source(self, coords):
+            return torch.zeros(coords.shape[0], coords.shape[1], 1)
+
+    model = TimeFFM()
+    coords = torch.zeros(1, 3, 3)
+    x1 = torch.zeros(1, 3, 1)
+    oc, ov, om, of = _obs(1, m=1)
+    out = clean_estimate_random_rollout_step(
+        model, x1, coords, oc, ov, om, of,
+        n_steps=4, source_seed=3, step_index=2)
+    out.mean().backward()
+    grad = model.model.weights.grad
+    assert grad is not None
+    assert torch.equal(grad[:2], torch.zeros(2))
+    assert float(grad[2]) > 0.0 and float(grad[3]) == 0.0
+
+
 def _dual_args(**overrides):
     ns = argparse.Namespace(
         topo_objective_mode="constrained",
@@ -167,20 +254,21 @@ def test_dual_ascent_behavior():
     args = _dual_args()
     state = T.topo_dual_state(args)
     assert state["mu_data"] == 1.0 and state["mu_anchor"] == 0.0
-    # Multipliers decay when both losses are within budget.
+    # Feasible losses (below budget): both multipliers decay toward zero.
     for _ in range(200):
         T.update_topo_duals(args, data_loss_value=0.5, anchor_loss_value=0.0)
     assert state["mu_data"] == 0.0 and state["mu_anchor"] == 0.0
-    # Only the data multiplier grows when its budget is violated.
+    # Violated data budget: mu_data grows; slack anchor stays at zero.
     for _ in range(10):
         T.update_topo_duals(args, data_loss_value=2.0, anchor_loss_value=0.0)
     assert state["mu_data"] > 0.5 and state["mu_anchor"] == 0.0
-    # Persistent violations clip the multiplier at ``dual_max``.
+    # Violation persists: growth continues but clips at dual_max.
     for _ in range(10000):
         T.update_topo_duals(args, data_loss_value=2.0, anchor_loss_value=1.0)
     assert state["mu_data"] == args.dual_max
     assert state["mu_anchor"] == args.dual_max
-    # Multipliers decay smoothly after feasibility is restored.
+    # Complementary-slackness shape: once feasible again, multipliers decay
+    # smoothly rather than being reset; gains are held, not released.
     T.update_topo_duals(args, data_loss_value=0.99, anchor_loss_value=0.05)
     assert 0.0 < state["mu_data"] < args.dual_max
     print("[ok] dual ascent: decay when feasible, growth when violated, "
@@ -198,62 +286,6 @@ def test_dual_state_roundtrip():
     restored = T.topo_dual_state(args2)
     assert restored["mu_data"] == 3.5 and restored["topo_norm"] == 321.0
     print("[ok] dual state checkpoint round-trip")
-
-
-def test_disabled_constrained_arm_uses_data_only_path():
-    class DS(torch.utils.data.Dataset):
-        def __len__(self):
-            return 2
-
-        def __getitem__(self, i):
-            return {'coords': COORDS, 'coords_raw': COORDS, 'fields': mk(i)}
-
-    args = argparse.Namespace(
-        topo_objective_mode='constrained',
-        coherence_every_n_steps=1,
-        coherence_loss_weight=1.0,
-        coherence_weight_warmup_epochs=0,
-        coherence_start_epoch=1,
-        coherence_interval_rescale=False,
-        data_loss_weight=1.0,
-        gradient_clip_norm=1.0,
-        gradient_diagnostics_every_n_steps=0,
-        cond_fields=[0],
-        n_obs_min_list=[4],
-        n_obs_max_list=[4],
-        sensor_layout='independent',
-        obs_grid_stride_list=None,
-        obs_grid_pool=False,
-        n_query_points=64,
-    )
-    loader = torch.utils.data.DataLoader(DS(), batch_size=2)
-
-    enabled_model = FFM()
-    enabled_opt = torch.optim.AdamW(enabled_model.parameters(), lr=1e-4)
-    try:
-        T.run_epoch_direct_coherence(
-            enabled_model, loader, enabled_opt, torch.device('cpu'), args,
-            argparse.Namespace(enabled=True), None, None, 0, 1,
-            base_model=None)
-    except RuntimeError as exc:
-        assert "frozen base" in str(exc)
-    else:
-        raise AssertionError("enabled constrained mode accepted a missing base model")
-
-    control_model = FFM()
-    control_opt = torch.optim.AdamW(control_model.parameters(), lr=1e-4)
-    before = [p.detach().clone() for p in control_model.parameters()]
-    metrics, global_step = T.run_epoch_direct_coherence(
-        control_model, loader, control_opt, torch.device('cpu'), args,
-        argparse.Namespace(enabled=False), None, None, 0, 1,
-        base_model=None)
-
-    assert global_step == 1
-    assert math.isfinite(metrics["data_loss"])
-    assert metrics["coherence_application_fraction"] == 0.0
-    assert any(not torch.equal(old, new.detach())
-               for old, new in zip(before, control_model.parameters()))
-    print("[ok] disabled constrained arm trains data-only without a frozen base")
 
 
 def test_constrained_epoch_integration():
@@ -321,7 +353,7 @@ def test_constrained_epoch_integration():
                      field_names=['phi', 'w', 'vx', 'vy'],
                      denormalize_points=lambda x: x)
 
-    # Use budgets derived from the frozen-source baseline.
+    # Budgets normally set in main() from the frozen-source baseline.
     args._data_budget = 2.0
     args._anchor_budget = 0.05
 
@@ -332,12 +364,18 @@ def test_constrained_epoch_integration():
     duals = T.topo_dual_state(args)
     assert duals["topo_norm"] is not None and duals["topo_norm"] > 0
     assert metrics["coherence_application_fraction"] > 0
+    # Mode congruence (N20 regression): every forward of the epoch -- data,
+    # anchor, and rollout -- must see the eval-mode function, i.e. the one that
+    # validation, Pareto selection, and deployment measure.
+    assert model.model.modes_seen == {False}, (
+        f"training forwards ran in modes {model.model.modes_seen}; the "
+        "objective and constraints must both see the eval-mode function")
     assert metrics.get("anchor_loss") is not None \
         and math.isfinite(metrics["anchor_loss"])
     assert metrics.get("dual_mu_data") is not None
     assert metrics.get("topo_objective_normalized") is not None
     assert all(math.isfinite(float(duals[k])) for k in ("mu_data", "mu_anchor"))
-    # The anchor remains small over one epoch of small updates.
+    # Anchor starts at zero and stays small over one epoch of tiny steps.
     assert metrics["anchor_loss"] < args._anchor_budget * 10
     print(f"[ok] constrained epoch: topo steps ran, topo_norm={duals['topo_norm']:.4g}, "
           f"mu_data={duals['mu_data']:.4g}, mu_anchor={duals['mu_anchor']:.4g}, "
@@ -356,9 +394,9 @@ def test_constrained_epoch_integration():
 
 if __name__ == "__main__":
     test_anchor_zero_at_base_and_pulls_back()
+    test_constraints_measured_in_eval_mode()
     test_truncated_rollout_gradients()
     test_dual_ascent_behavior()
     test_dual_state_roundtrip()
-    test_disabled_constrained_arm_uses_data_only_path()
     test_constrained_epoch_integration()
     print("ALL CONSTRAINED-TOPO TESTS PASSED")

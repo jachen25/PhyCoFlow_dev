@@ -1,6 +1,6 @@
-"""Test the cross-validated pointwise-degeneracy guard."""
+"""Regression tests for the cross-validated pointwise-degeneracy guard."""
 
-# Support direct execution from any working directory.
+# Make src/ importable when run from any cwd.
 import os as _os
 import sys as _sys
 _SRC_DIR = _os.path.abspath(_os.path.join(

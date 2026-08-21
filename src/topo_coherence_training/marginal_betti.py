@@ -60,16 +60,16 @@ def soft_betti0_curve(f_hw: torch.Tensor, levels: torch.Tensor, kappa: float,
     H, W = f_hw.shape
     adj = _get_adj(H, W, periodic, connectivity)
     f = f_hw.reshape(-1)
-    g_np = (-f).detach().cpu().numpy()                       # Sublevel of -f equals superlevel of f.
+    g_np = (-f).detach().cpu().numpy()                       # sublevel of -f == superlevel of f
     b_idx, d_idx, ess_idx = h0_sublevel_pairs(g_np, adj)
     births = f[torch.as_tensor(b_idx, device=f.device, dtype=torch.long)] if b_idx.size else f.new_zeros(0)
     deaths = f[torch.as_tensor(d_idx, device=f.device, dtype=torch.long)] if d_idx.size else f.new_zeros(0)
-    ess = f[ess_idx]                                         # Essential class born at the global maximum.
+    ess = f[ess_idx]                                         # global max of f (never dies)
     a = levels[:, None]                                      # [T,1]
-    # The essential component is alive at levels at or below its birth.
+    # essential (global-max component): alive for a <= birth
     curve = _st(torch.sigmoid(kappa * (ess - levels)), ess >= levels)    # [T]
     if births.numel():
-        # A finite super-level bar is alive when death < level <= birth.
+        # finite bar alive at level a  <=>  death < a <= birth (super-level filtration)
         born = _st(torch.sigmoid(kappa * (births[None, :] - a)), births[None, :] >= a)
         alive = _st(torch.sigmoid(kappa * (a - deaths[None, :])), a > deaths[None, :])
         curve = curve + (born * alive).sum(dim=1)

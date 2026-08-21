@@ -1,10 +1,18 @@
-"""Test the distributional self cells of the unified marginal loss.
+"""CPU test for the general distributional self cells of _marginal_unified_loss.
 
-Coverage includes saliency filtration, loop overproduction, reference matching,
-gradients, and missing-stratum validation.
+Verifies, on synthetic 2-channel fields, that the self H0 and H1 cells:
+  1. run on a dataset-agnostic saliency (z-score) filtration at
+     reference-quantile levels (no physical levels, no mean/std
+     denormalisation);
+  2. penalise over-production of loops (gen ring b1=1 vs data disk b1=0) with
+     a gradient;
+  3. return ~0 when the generated field matches the reference (disk == disk);
+  4. reject strata with no reference.
+
+    python src/test_marginal_unified.py    # exit 0 iff all pass
 """
 
-# Support direct execution from any working directory.
+# Make src/ importable when run from any cwd.
 import os as _os
 import sys as _sys
 _SRC_DIR = _os.path.abspath(_os.path.join(
@@ -47,7 +55,8 @@ def _sal(field_hw):
 
 def main():
     ok = True
-    # Build disk reference curves from saliency quantiles.
+    # Reference (data-mean) curves for channel 0 = disk, on its own saliency
+    # at reference-quantile levels.
     sal_ref = _sal(DISK)
     lv = torch.quantile(sal_ref.flatten(), QUANTS)                       # reference-quantile levels [T]
     ref_h0 = soft_betti_curve_dim(sal_ref, lv, 0, periodic=True).detach()
@@ -85,7 +94,8 @@ def main():
         total.backward()
         return float(total.detach()), metrics, g.grad
 
-    # A generated ring against disk data produces an H1 gradient.
+    # 1/2. Over-production: gen ring (b1=1) vs data disk (b1=0) penalises
+    # self_h1, and the gradient flows.
     l_over, m_over, grad = run(RING, ["A", "B"])
     over_ok = (l_over > 1e-6 and m_over.get("self_h1", 0) > 1e-6
                and grad is not None and torch.isfinite(grad).all() and float(grad.abs().sum()) > 0
@@ -95,13 +105,13 @@ def main():
           f"grad|sum|={float(grad.abs().sum()):.3g}  {'PASS' if over_ok else 'FAIL'}")
     ok = ok and over_ok and (m_over.get("self_h1", 0) > m_over.get("self_h0", 0))
 
-    # Matching disk fields produce near-zero loss.
+    # 3. Match: gen == reference (disk) gives ~0.
     l_match, m_match, _ = run(DISK, ["A", "B"])
     match_ok = l_match < 1e-6
     print(f"3. MATCH (disk vs disk): total={l_match:.6f}  {'PASS' if match_ok else 'FAIL'}")
     ok = ok and match_ok
 
-    # Unknown strata raise instead of deactivating topology cells.
+    # 4. Unknown strata fail instead of silently deactivating topology cells.
     try:
         run(RING, ["A", "Z"])
         strat_ok = False

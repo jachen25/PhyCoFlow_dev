@@ -1,4 +1,4 @@
-# N12 parameter-conditioned baseline with checkpoint reload enabled.
+# Resume N12 from last.pt to epoch 10000 and save ckpt_ep10000.pt.
 
 Demo_Num: 12
 device_ids: [0]

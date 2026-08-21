@@ -1,15 +1,17 @@
-"""Saliency fields for topological coherence.
+"""
+Saliency fields for topological coherence.
 
 Each physical channel ``c`` gets a *saliency field* ``s_c(x)`` that exposes
 the physically meaningful structure of that channel.  Region topology
 (connected components, RCC relations) is then computed on thresholdings of the
-saliency field rather than on the raw signal. This permits a common threshold
-rule across channels with different dynamic ranges
+saliency field rather than on the raw signal -- this lets a single, uniform
+threshold rule make sense across channels with very different dynamic ranges
 (e.g. temperature vs. a trace species mass fraction).
 
 All functions operate on a single field ``[H, W]`` (or ``[D, H, W]`` for 3D)
-and return an array of the same spatial shape. Non-finite values map to the
-finite field minimum after the saliency transform.
+and return an array of the same spatial shape.  NaNs are handled explicitly:
+they are treated as "no structure" (mapped to the field minimum after the
+saliency transform) so they never silently propagate into thresholding.
 """
 
 from __future__ import annotations
@@ -18,14 +20,15 @@ from typing import Callable, Dict, Union
 
 import numpy as np
 
-# A saliency function preserves one channel's spatial shape.
+# A saliency function maps one channel field -> a non-negative-ish saliency map
+# of the same spatial shape.
 SaliencyFn = Callable[[np.ndarray], np.ndarray]
 
 SaliencySpec = Union[str, SaliencyFn]
 
 
 def _finite_minmax(a: np.ndarray) -> tuple[float, float]:
-    """Return the minimum and maximum over finite entries."""
+    """Min/max over finite entries only (robust to NaN/Inf)."""
     finite = np.isfinite(a)
     if not finite.any():
         return 0.0, 0.0
@@ -35,8 +38,9 @@ def _finite_minmax(a: np.ndarray) -> tuple[float, float]:
 def _sanitize(s: np.ndarray) -> np.ndarray:
     """Replace non-finite saliency values with the finite minimum.
 
-    Non-finite input is treated as having minimum saliency so it does not
-    affect percentile or threshold calculations.
+    Rationale: a NaN in the raw field means "no measured structure here", so
+    after a saliency transform it should map to the *least* salient value, not
+    poison the percentile/threshold computation.
     """
     s = np.asarray(s, dtype=np.float64)
     if np.isfinite(s).all():
@@ -74,8 +78,8 @@ def saliency_grad_mag(u_c: np.ndarray) -> np.ndarray:
 def saliency_zscore_abs(u_c: np.ndarray) -> np.ndarray:
     """``s_c = |(u_c - mean)/std|`` -- standardized magnitude.
 
-    A shared quantile threshold then has the same standardized interpretation
-    across fields.
+    Scale-invariant: a 2-sigma excursion is equally salient in every channel,
+    which makes a shared quantile threshold meaningful across fields.
     """
     u_c = _sanitize(u_c)
     finite = np.isfinite(u_c)

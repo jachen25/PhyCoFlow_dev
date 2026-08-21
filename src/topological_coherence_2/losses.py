@@ -1,4 +1,5 @@
-"""Topological coherence losses.
+"""
+Topological coherence loss.
 
 Given the mutual-relatedness profiles of a prediction and a reference, measure
 how much their *qualitative spatial relationships* between fields differ.
@@ -9,9 +10,11 @@ predicted and reference vectors, summed over field pairs:
     L_MR_RCC = sum_{i<j} mean_{a_i, a_j} D_cat( mu_pred_ij(a_i,a_j,.),
                                                 mu_ref_ij (a_i,a_j,.) )
 
-The loss is zero when every relation distribution matches. Saliency transforms
-and quantile thresholds separate this structural comparison from absolute
-field magnitudes.
+The loss is 0 iff every relation distribution matches, and grows as the
+reconstruction reshuffles which regions are disconnected / overlapping /
+contained across fields.  It is invariant to absolute field magnitudes (those
+are baked out by the saliency + quantile-threshold step), so it isolates
+*structural* coherence error from pointwise amplitude error.
 """
 
 from __future__ import annotations
@@ -28,8 +31,10 @@ _EPS = 1e-12
 def _safe_norm(p: np.ndarray) -> np.ndarray:
     """Normalize a non-negative vector to a probability vector.
 
-    An all-zero vector maps to a uniform distribution. If both prediction and
-    reference are empty, their divergence is zero.
+    An all-zero vector (a threshold pair with no components on one side) maps
+    to a *uniform* distribution: "no structure" is treated as maximal
+    uncertainty, so it neither rewards nor spuriously penalizes, and if both
+    pred and ref are empty their divergence is exactly 0.
     """
     p = np.asarray(p, dtype=np.float64)
     s = p.sum()

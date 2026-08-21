@@ -6,8 +6,8 @@ the restriction is the scalar filtration
 directions and reference-derived offsets, applies a shared monotone axis map, and
 averages induced Betti-matching losses across lines.
 
-``pointwise_r2`` and the null providers measure whether the second field adds
-non-pointwise information.
+The second field must add non-pointwise information. ``pointwise_r2`` and the null
+providers are diagnostics, not proofs of multiparameter usefulness.
 """
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ import torch
 from .betti_matching import betti_loss_field
 
 
-# Admissible lines.
+# Admissible lines
 
 @dataclass(frozen=True)
 class AdmissibleLine:
@@ -46,10 +46,13 @@ def sample_admissible_lines(
     generator: Optional[torch.Generator] = None,
     sampling: str = "random",
 ) -> List[AdmissibleLine]:
-    """Return positive-slope lines with reference-quantile offsets.
+    """Positive-slope lines with reference-quantile offsets.
 
-    ``random`` samples angles and offsets independently. ``fan`` uses evenly
-    spaced angles and crossed offset quantiles.
+    sampling:
+      "random" -- i.i.d. angles/offsets (unbiased stochastic estimate; training).
+      "fan"    -- deterministic evenly-spaced angles with crossed evenly-spaced
+                  offset quantiles: a fixed function of the reference fields, so
+                  evaluation numbers are reproducible and comparable across runs.
     """
     if n_lines < 1:
         raise ValueError(f"n_lines must be >= 1, got {n_lines}")
@@ -66,7 +69,7 @@ def sample_admissible_lines(
         frac = (torch.arange(n_lines, device=dev, dtype=torch.float32) + 0.5) / n_lines
         thetas = th_min + (th_max - th_min) * frac
         qs = q_lo + (q_hi - q_lo) * frac
-        qt = q_lo + (q_hi - q_lo) * (1.0 - frac)   # Crossed quantiles cover both axes.
+        qt = q_lo + (q_hi - q_lo) * (1.0 - frac)   # crossed: covers both axes' ranges
     else:
         u_th = torch.rand(n_lines, device=dev, generator=generator)
         thetas = th_min + (th_max - th_min) * u_th
@@ -77,8 +80,11 @@ def sample_admissible_lines(
 
     pf = g1_ref.detach().flatten().float()
     pp = g2_ref.detach().flatten().float()
-    s0s = torch.quantile(pf, qs)
-    t0s = torch.quantile(pp, qt)
+    # ``torch.set_default_dtype(float64)`` can make the sampled quantiles
+    # float64 while the detached filtration arrays are intentionally float32.
+    # torch.quantile requires an exact dtype match (PyTorch 2.9+).
+    s0s = torch.quantile(pf, qs.to(dtype=pf.dtype))
+    t0s = torch.quantile(pp, qt.to(dtype=pp.dtype))
 
     lines: List[AdmissibleLine] = []
     for k in range(n_lines):
@@ -157,7 +163,7 @@ def reference_level_tau(
     return level, tau_scale * spread
 
 
-# Second-filtration providers.
+# Second-filtration providers must add non-pointwise information.
 
 _PROVIDERS = ("abs_channel", "channel", "grad_mag")
 
@@ -325,8 +331,9 @@ def pointwise_conditional_null(
 def pointwise_r2(g1: torch.Tensor, g2: torch.Tensor, n_bins: int = 64) -> float:
     """Cross-validated 1-D interpolation R² for ``g2 = f(g1)`` degeneracy.
 
-    Alternating sorted samples form the two folds. ``n_bins`` remains for API
-    compatibility and is not used.
+    Alternating sorted samples form two folds. Each fold is predicted from the
+    other, preventing the in-sample overfit of a one-point-per-bin estimator.
+    ``n_bins`` is retained for API compatibility and is not used.
     """
     del n_bins
     x = g1.detach().reshape(-1).double().cpu().numpy()
@@ -505,7 +512,7 @@ def fibered_h1_loss_batch(
     g2_ref: torch.Tensor,
     **kw,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
-    """Apply the per-sample persistence calculation to a ``[B,H,W]`` batch."""
+    """Loop the per-sample persistence calculation over a ``[B,H,W]`` batch."""
     if g1.dim() != 3:
         raise ValueError(f"expected [B,H,W], got {tuple(g1.shape)}")
     B = g1.shape[0]

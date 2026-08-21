@@ -191,7 +191,7 @@ class TurbulentCombustionH5Dataset(Dataset):
         return {
             "coords": self.coords.clone(),          # normalized coordinates for model
             "coords_raw": self.coords_raw.clone(),  # original physical coordinates for plotting
-            "fields": x,
+            "fields": x,                    
             "time_index": torch.tensor(t_idx, dtype=torch.long),
             "physical_time": self.times[t_idx].clone(),
         }
@@ -383,7 +383,12 @@ class ActiveEmulsionDataset(Dataset):
         return out
 
     def _load_or_compute_param_stats(self, train_runs):
-        """Return cached training statistics for transformed ``(H, R, m)``."""
+        """(mu, sigma) of the transformed (H,R,m) over the train runs, as float32 [3].
+
+        Cached in its own file so it never invalidates the (much more expensive) field
+        stats cache. Reads three scalars per run; npz member access is lazy, so the
+        field arrays are not touched.
+        """
         p = Path(os.path.expanduser(self.stats_path))
         p = p.with_name(p.stem + "_params.pt")
         names = list(self.PARAM_NAMES)
@@ -392,7 +397,8 @@ class ActiveEmulsionDataset(Dataset):
             if list(obj.get("param_names", [])) == names and \
                     list(obj.get("param_log", [])) == list(self.PARAM_LOG):
                 return obj["mu"].float(), obj["sigma"].float()
-            # Recompute when the cached parameter specification differs.
+            # Stale cache from a different parameter set / transform: recompute rather
+            # than silently standardizing with the wrong constants.
             print(f"[ae] param-stats cache {p.name} has a different param spec; recomputing.")
         raw = np.empty((len(train_runs), len(names)), dtype=np.float64)
         for i, fn in enumerate(train_runs):
@@ -508,10 +514,17 @@ class ActiveEmulsionDataset(Dataset):
     }
 
     def _augment_raw(self, arr_pc):
-        """Apply the configured torus symmetry in raw physical units.
+        """Apply the configured exact torus symmetry to one RAW sample.
 
-        Input and output use flattened ``(y, x)`` point order. Rotation precedes
-        normalization so velocity-component scaling remains valid.
+        arr_pc is (num_points, C) in the flattened (y,x) order used throughout;
+        returns a new contiguous array of the same shape. Must run before
+        normalize() so the rotation's vx/vy swap happens in physical units
+        (the per-channel asinh scale and std differ across channels, so
+        swapping normalized components would not be exact).
+
+        Randomness comes from the global torch RNG, which DataLoader reseeds
+        per worker and per epoch, so every epoch sees fresh shifts and the
+        workers do not draw identical streams.
         """
         if self.augment == "none":
             return arr_pc
@@ -564,7 +577,11 @@ class ActiveEmulsionDataset(Dataset):
 # MetricsLogger is re-exported from helpers_baseline.
 
 def create_recon_dir(base_dir: str, Demo_Num: int, timestamp: str, method_name: str = "ffm_pointcloud") -> str:
-    """Create a timestamped evaluation-plot directory."""
+    """Creates a timestamped directory for saving evaluation plots.
+
+    method_name controls the leaf folder under base_dir (e.g. ``ffm_pointcloud``).
+    Default preserves the original layout for callers that don't pass a method name.
+    """
     path = os.path.join(base_dir, method_name, f"demo_N{Demo_Num}_{timestamp}")
     os.makedirs(path, exist_ok=True)
     return path
@@ -849,7 +866,7 @@ def reconstruct_snapshot(
         pool_value_transform=resolve_pooled_value_transform(dataset),
     )
 
-    # Pass only controls supported by the sampler signature.
+    # Support generalized and legacy single-field samplers.
     sig = inspect.signature(model.sample)
     sample_kwargs = dict(
         coords=coords,
@@ -1003,8 +1020,8 @@ def visualize_reconstruction(
         effective_obs_mode = "none"
 
     # Pooled observations are block means: clamping them into single pixels
-    # would inject wrong values. Raw conditional sampling is the default;
-    # smooth endpoint guidance remains an explicit opt-in.
+    # would inject wrong values. The resolver makes raw conditional sampling
+    # the default; smooth endpoint guidance remains an explicit opt-in.
     effective_obs_mode, obs_consistency_final_clamp = resolve_pooled_obs_consistency(
         effective_obs_mode, obs_consistency_final_clamp, obs_grid_pool,
         context="visualize_reconstruction")
@@ -1057,9 +1074,10 @@ def visualize_reconstruction(
     valid = obs_mask[0].bool()
     obs_indices_cpu = obs_indices[0, valid].cpu().numpy()
     obs_field_ids_cpu = obs_field_ids[0, valid].cpu().numpy()
-    # Pooled observations live at block centroids, not at obs_indices'
-    # representative pixels. Draw their true centroids whenever model and
-    # plotting coordinates share the same x/y frame.
+    # Gather sensor coordinates on CPU for either plotting mesh. Pooled
+    # observations live at block centroids, not at obs_indices' representative
+    # pixels. Active-emulsion model and plotting coordinates share [0,1]^2, so
+    # draw those true centroids whenever the coordinate systems agree.
     obs_coords_raw = coords_raw[0, obs_indices[0].cpu()].numpy()[valid.cpu().numpy()]
     pooled_centroids_raw = None
     if obs_grid_pool:
@@ -1227,7 +1245,7 @@ def visualize_reconstruction(
         "obs_mask": obs_mask.detach().cpu(),
         "obs_indices": obs_indices.detach().cpu(),
         "obs_field_ids": obs_field_ids.detach().cpu(),
-        # Valid-only arrays used by plot overlays and compatibility consumers.
+        # Valid-only numpy arrays kept for plot overlays / backward use.
         "obs_indices_valid": obs_indices_cpu,
         "obs_field_ids_valid": obs_field_ids_cpu,
         "field_names": list(field_names),

@@ -55,7 +55,7 @@ __all__ = [
     "scatter_sensors_to_nodes",
 ]
 
-# Utility helpers.
+# --- §1. Utility helpers ---
 
 def _to_int_list(x: Union[int, Sequence[int], None]) -> list[int]:
     if x is None:
@@ -133,7 +133,7 @@ def _torch_load_compat(path, map_location="cpu"):
     except TypeError:
         return torch.load(path, map_location=map_location)
 
-# Datasets.
+# --- §2. Datasets ---
 
 class TurbulentCombustionH5Dataset(Dataset):
     """Treat each time snapshot as one point-cloud sample."""
@@ -240,7 +240,7 @@ class TurbulentCombustionH5Dataset(Dataset):
         return {
             "coords": self.coords.clone(),          # normalized coordinates for model
             "coords_raw": self.coords_raw.clone(),  # original physical coordinates for plotting
-            "fields": x,
+            "fields": x,                    
             "time_index": torch.tensor(t_idx, dtype=torch.long),
             "physical_time": self.times[t_idx].clone(),
         }
@@ -257,8 +257,9 @@ class AirfoilWakeLESDataset(TurbulentCombustionH5Dataset):
     a multimodal setting: deterministic mean-regression blurs toward the
     time-mean, while a generative model samples sharp instantaneous fields.
 
-    The loader expects the project H5 schema and inherits its H5/statistics
-    logic from TurbulentCombustionH5Dataset. Two wake-specific differences:
+    The raw Deep Blue data is converted to the project H5 schema by
+    preprocess_airfoil_wake_les.py, so the H5 / stats logic is inherited
+    unchanged from TurbulentCombustionH5Dataset. Two wake-specific differences:
       - default field set is the 2D velocity (ux, uy); uz is dropped;
       - the split defaults to 'random' to match TurbulentCombustionH5Dataset;
         pass split_mode='block' for a temporal held-out-tail split.
@@ -395,7 +396,9 @@ class ElasticityDataset(Dataset):
         Ny, Nx, N_samples = sigma_all.shape
         self.grid_Ny = Ny
         self.grid_Nx = Nx
-        # Structured-grid consumers use the (Ny, Nx) axis convention.
+        # grid_shape=(Ny,Nx) consumed by helpers._build_structured_triangulation
+        # (see train_latentfm_baseline.py:258, train_sit_baseline.py:645,
+        # evaluate_ffm.py:714 for the same (Ny,Nx) convention).
         self.grid_shape = (Ny, Nx)
 
         yy, xx = np.meshgrid(
@@ -643,7 +646,7 @@ class AirfoilInterpDataset(Dataset):
 
     Designed to read either:
       - ``naca_interp/``        (the published 1-channel release)
-      - ``naca_interp_5f/``     (the five-field project schema)
+      - ``naca_interp_5f/``     (preprocess_airfoil_interp_5field.py output)
     by passing the appropriate ``interp_subdir``.
 
     Unlike AirfoilCGridDataset (whose per-sample body-fitted C-mesh
@@ -991,7 +994,9 @@ class CarCFDDataset(Dataset):
                 f"(ahmed) or '{self.data_dir}/data' (shapenet) to exist."
             )
 
-        # Dataset-wide bounds place every car in a shared coordinate frame.
+        # Coordinate normalization uses the dataset-wide bounds so every car
+        # lives in the same reference box (sensors at the same physical place
+        # have the same normalized coord regardless of which car is loaded).
         bounds_path = os.path.join(self.data_dir, 'global_bounds.txt')
         if os.path.exists(bounds_path):
             with open(bounds_path) as fh:
@@ -1048,7 +1053,10 @@ class CarCFDDataset(Dataset):
         self.cache_dir = cache_dir or os.path.join(self.data_dir, '_cache_pt')
         os.makedirs(self.cache_dir, exist_ok=True)
 
-        # Expose a deterministic reference point cloud for model construction.
+        # Expose a reference point cloud for visualization helpers / model
+        # construction; coords_raw holds physical mm-scale coordinates.
+        # Reference subsample is deterministic regardless of split so model
+        # construction sees a stable point set.
         ref_full = self._load_full(0)
         ref = self._subsample(ref_full, self._deterministic_rng(ref_full['sample_id']))
         self.coords = ref['coords'].clone()
@@ -1146,14 +1154,18 @@ class CarCFDDataset(Dataset):
         return obj
 
     def _deterministic_rng(self, sid: str) -> 'np.random.Generator':
-        # Use a stable digest because Python hashes vary across processes.
+        # Stable per-sample seed for val/test and reference-point construction.
+        # Python's builtin hash() is salted per-process, so we use a stable
+        # hashlib digest instead.
         import hashlib
         digest = hashlib.blake2b(f'car_cfd::{sid}::{self.seed}'.encode(),
                                  digest_size=4).digest()
         return np.random.default_rng(int.from_bytes(digest, 'little'))
 
     def _subsample(self, full, rng: 'np.random.Generator'):
-        """Return an independent ``self.n_points`` mesh subsample."""
+        """Pick ``self.n_points`` rows from the full mesh using ``rng``.
+        Returns a new dict that shares no storage with ``full`` (safe to mutate
+        downstream)."""
         n_total = full['coords'].shape[0]
         if n_total >= self.n_points:
             idx = rng.choice(n_total, size=self.n_points, replace=False)
@@ -1173,7 +1185,11 @@ class CarCFDDataset(Dataset):
         return len(self._sample_keys)
 
     def _augment(self, s, rng: 'np.random.Generator'):
-        """Apply training-time geometry transforms in physical coordinates."""
+        """Train-only geometric augmentation that preserves the pressure
+        field: lateral flip about the symmetry plane, small yaw about the
+        up axis, optional small coord jitter. All transforms happen in
+        physical (raw) coords; ``coords`` is re-derived from the fixed
+        global bounds afterwards."""
         coords_raw = s['coords_raw'].numpy().copy()
         lat = self.lateral_axis
         up = self.up_axis
@@ -1272,7 +1288,7 @@ class CarCFDDataset(Dataset):
         }
 
 
-# Collation and grid validation.
+# --- §3. Collation & grid validation ---
 
 def collate_snapshots(batch):
     """Shared collate that handles optional keys like valid_sensor_mask, coords_raw."""
@@ -1339,7 +1355,7 @@ def validate_regular_grid_compatibility(
             f"but requested (Num_x, Num_y)=({Num_x}, {Num_y})."
         )
 
-# Grid and point-cloud interchange.
+# --- §4. Grid <-> point-cloud interchange ---
 
 def pointcloud_to_grid(x: torch.Tensor, Num_y: int, Num_x: int) -> torch.Tensor:
     """[B, N, C] -> [B, C, Num_y, Num_x]. Assumes N == Num_y * Num_x, row-major."""
@@ -1495,9 +1511,16 @@ def _build_structured_triangulation(coords_xy: np.ndarray, grid_shape):
     )
     return mtri.Triangulation(x, y, triangles=tris)
 
-# Sparse-condition construction.
+# --- §5. Sparse-condition construction ---
 
-# Evaluation-time sensor noise in normalized field units.
+# Evaluation-time sensor corruption for robustness sweeps. Set by an evaluator
+# via set_obs_noise() before reconstruction; build_sparse_condition reads it and
+# adds Gaussian noise to the extracted sensor values (in normalized units, so
+# the level is a noise-to-signal ratio relative to each field's unit std). Off
+# (0.0) by default, so training and ordinary evaluation are unaffected. The
+# noise is drawn from the global torch RNG, which the evaluators seed per
+# snapshot (--sensor-seed); identical cond_fields/n_obs across methods therefore
+# yield an identical noise realization per snapshot, keeping the comparison fair.
 _OBS_NOISE_STD = 0.0
 
 
@@ -1606,10 +1629,10 @@ def resolve_pooled_obs_consistency(mode: str, final_clamp: bool,
     single pixel, so scatter-clamping it into its representative node
     (default_hard, endpoint, or the final trusted-sensor clamp) would write
     systematically wrong values wherever blocks straddle interfaces.
-    Raw sampling (``none``) is the safe default because the observations
-    already condition the network through sensor tokens. ``endpoint_smooth``
-    remains available as an explicit opt-in, but its interpolation can imprint
-    the coarse lattice when its bandwidth is too narrow.
+    Raw sampling ('none') is the safe default because the observations already
+    condition the network through sensor tokens. ``endpoint_smooth`` remains
+    available as an explicit opt-in, but its Gaussian interpolation can itself
+    imprint the coarse lattice when its bandwidth is too narrow.
     """
     if not obs_grid_pool:
         return mode, final_clamp
@@ -1645,11 +1668,15 @@ _POOLED_NOTICES: set = set()
 
 
 def resolve_pooled_value_transform(dataset):
-    """Return an opt-in dataset adapter for physical-space block averages.
+    """Return a dataset adapter for physically meaningful block averages.
 
-    Dataset wrappers such as ``Subset`` are unwrapped automatically. Datasets
-    without the explicit two-way transform contract retain historical
-    model-space pooling behavior.
+    A dataset opts in with ``pool_observations_physical=True`` and by exposing
+    ``denormalize`` for full field tensors plus
+    ``normalize_field(values, field_id)`` for one channel. This lets coarse
+    sensors average in the raw physical representation and only then map the
+    block mean into model space. Dataset wrappers such as ``Subset`` are
+    unwrapped automatically. Datasets without the explicit two-way contract
+    retain the historical model-space pooling behavior.
     """
     current = dataset
     seen = set()
@@ -1711,18 +1738,20 @@ def build_sparse_condition(
             obs_indices holds the block-center node as a representative for
             rasterization/diagnostics only. A block mean is not the field
             value at any single pixel, so pooled observations must not be
-            hard-clamped into the generated field: sample with
-            obs_consistency_mode='endpoint_smooth' (or 'none') and no final
-            clamp; resolve_pooled_obs_consistency() enforces this at the
-            call sites. Requires a full regular grid (every (iy, ix) node
+            hard-clamped into the generated field. Sampling defaults to
+            obs_consistency_mode='none'; endpoint_smooth is an explicit opt-in,
+            always without a final clamp. resolve_pooled_obs_consistency()
+            enforces this at call sites. Requires a full regular grid (every (iy, ix) node
             occupied exactly once). Consumes no RNG. Ignored for stride-0
             (random) fields.
         pool_value_transform: optional dataset adapter exposing
             ``denormalize(fields_full)`` and
             ``normalize_field(block_values, field_id)``. When supplied,
-            block means are taken in raw physical space and then transformed
-            back to model space. Random and non-pooled observations are
-            unchanged.
+            strided block means are taken in raw physical space and then
+            transformed back to model space. This matters for nonlinear field
+            transforms (for example Active Emulsion's asinh velocity map), for
+            which mean(transform(v)) != transform(mean(v)). Random and
+            non-pooled observations are unchanged.
 
     Returns:
         obs_coords:    [B, M, D]
@@ -2019,24 +2048,28 @@ def nearest_fill_grid(value_grid: torch.Tensor,
     return torch.from_numpy(filled).to(device=dev, dtype=dtype)
 
 
-# Metrics and logging.
+# --- §6. Metrics & logging ---
 
 class MetricsLogger:
     def __init__(self, base_dir: str, Demo_Num: int, timestamp: str,
                  method_name: Optional[str] = None,
                  resume_through_epoch: Optional[int] = None):
-        """Create the run directory and restore or initialize its loss CSV."""
+        """
+        Initializes the logger, creates the timestamped directory,
+        and sets up the CSV file with headers.
+        """
         self.method_name = method_name or "Model"
-        # Create the timestamped loss directory.
+        # Create timestamped directory: Loss_YYYYMMDD_HHMMSS
+        # timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.save_dir = os.path.join(base_dir, f"Loss_DemoN{Demo_Num}_{timestamp}")
         os.makedirs(self.save_dir, exist_ok=True)
-
+        
         self.csv_path = os.path.join(self.save_dir, "losses.csv")
         self.plot_path = os.path.join(self.save_dir, "loss_curve.png")
-
+        
         # Restore history when a wall-time-limited run is resumed. Reopening
-        # with ``w`` would erase the active curve. Rows beyond the checkpoint
-        # epoch are discarded so a resumed run cannot append a second branch.
+        # with ``w`` used to erase the active curve and forced the trainer to
+        # recursively duplicate the whole loss/reconstruction tree first.
         self.epochs = []
         self.train_losses = []
         self.val_losses = []
@@ -2085,42 +2118,45 @@ class MetricsLogger:
                 writer.writerow(["epoch", "train_loss", "val_loss"])
 
     def log_and_plot(self, epoch: int, train_loss: float, val_loss: float = None):
-        """Append epoch losses and update the loss curve."""
-        # Update history.
+        """
+        Saves the current epoch's losses to the CSV and updates the loss curve plot.
+        Pass val_loss=None if validation wasn't run this epoch.
+        """
+        # 1. Update history
         self.epochs.append(epoch)
         self.train_losses.append(train_loss)
         self.val_losses.append(val_loss)
-
-        # Append to CSV.
+        
+        # 2. Append to CSV
         with open(self.csv_path, mode='a', newline='') as f:
             writer = csv.writer(f)
-            # Represent missing validation loss as an empty cell.
+            # If val_loss is None, it writes an empty string for that cell
             writer.writerow([epoch, train_loss, val_loss if val_loss is not None else ""])
-
-        # Update the plot.
+            
+        # 3. Update the Plot
         plt.figure(figsize=(10, 6))
         plt.plot(self.epochs, self.train_losses, label='Train Loss', marker='o', color='blue', markersize=4)
-
-        # Filter missing validation values.
+        
+        # Filter out 'None' values for validation plotting
         v_epochs = [e for e, v in zip(self.epochs, self.val_losses) if v is not None]
         v_losses = [v for v in self.val_losses if v is not None]
-
+        
         if v_losses:
             plt.plot(v_epochs, v_losses, label='Validation Loss', marker='s', color='orange', markersize=5)
-
+            
         plt.xlabel('Epoch')
         plt.ylabel('Loss (MSE)')
         plt.title(f'{self.method_name} Training Progress')
-        plt.yscale('log')  # Flow-matching MSE spans multiple scales.
+        plt.yscale('log')  # Log scale is usually best for flow matching MSE
         plt.grid(True, which="both", ls="--", alpha=0.5)
         plt.legend()
         plt.tight_layout()
-
-        # Replace the current loss-curve artifact.
+        
+        # Overwrite the previous image
         plt.savefig(self.plot_path)
-        plt.close()  # Release the figure.
+        plt.close() # Close figure to free memory
 
-# Visualization.
+# --- §7. Visualization ---
 
 def _save_single_field_plot(
     true_f=None, pred_f=None, coords_xy=None, sensor_coords=None,
@@ -2130,7 +2166,19 @@ def _save_single_field_plot(
     contour_levels=20, contour_linewidth=0.5, contour_alpha=0.5,
     **kwargs,
 ):
-    """Save truth, reconstruction, and absolute-error panels."""
+    """
+    Module-level 3-panel plot (Ground truth / Reconstruction / |Error|).
+
+    Compatible with both the original keyword-only call from
+    visualize_reconstruction and the positional calls in the baselines,
+    which pass extra ``triang`` / ``body_polygon`` kwargs for body-fitted
+    plotting. If ``triang`` is not supplied, a Delaunay triangulation is
+    built from ``coords_xy`` as before.
+    """
+    # Superset of the earlier keyword-only signature; adds optional
+    # triang / body_polygon kwargs used by baseline scripts
+    # (train_latentfm_baseline.py, train_sit_baseline.py,
+    # train_senseiver_baseline.py, evaluate_ffm.py, evaluate_s3gm.py).
     x_plot = coords_xy[:, 0]
     y_plot = coords_xy[:, 1]
 
@@ -2667,10 +2715,13 @@ def visualize_reconstruction(
     return metrics
 
 
-# Training-resume utilities.
+# --- §8. Training-resume utilities ---
 
 def find_latest_run_dir(save_root: Path, run_prefix: str) -> Optional[Path]:
-    """Return the latest timestamped run matching ``run_prefix``."""
+    """Return the most recently-named run directory matching run_prefix
+    directly under save_root, or None. Sort is lexicographic on the trailing
+    YYYYMMDD_HHMMSS timestamp baked into the directory name.
+    """
     save_root = Path(save_root)
     if not save_root.exists():
         return None
@@ -2681,7 +2732,10 @@ def find_latest_run_dir(save_root: Path, run_prefix: str) -> Optional[Path]:
 
 
 def extract_run_timestamp(run_dir: Path, run_prefix: str) -> str:
-    """Extract a run timestamp, falling back to the current time."""
+    """Recover the YYYYMMDD_HHMMSS suffix from a run directory created with
+    `{run_prefix}{timestamp}`. Falls back to the current time if the name
+    does not match the expected pattern.
+    """
     name = Path(run_dir).name
     if name.startswith(run_prefix):
         return name[len(run_prefix):]
@@ -2689,7 +2743,9 @@ def extract_run_timestamp(run_dir: Path, run_prefix: str) -> str:
 
 
 def backup_path(path: Path, suffix: str = "_bk") -> Path:
-    """Return an unused sibling backup path with an optional counter."""
+    """Return a sibling path with `suffix` inserted before the extension that
+    does not already exist on disk. Adds a numeric counter if needed.
+    """
     path = Path(path)
     candidate = path.with_name(f"{path.stem}{suffix}{path.suffix}")
     if not candidate.exists():
@@ -2703,7 +2759,9 @@ def backup_path(path: Path, suffix: str = "_bk") -> Path:
 
 
 def backup_existing_artifact(path: Path) -> None:
-    """Copy an existing artifact to an unused ``_bk`` sibling."""
+    """Copy `path` (file or directory) to a `_bk` sibling if it exists. Used
+    before overwriting artifacts from a prior run during RELOAD.
+    """
     path = Path(path)
     if not path.exists():
         return
@@ -2714,7 +2772,10 @@ def backup_existing_artifact(path: Path) -> None:
         shutil.copy2(path, target)
 
 
-# Shared grid and point-cloud layout utilities.
+# --- §9. Shared grid <-> point-cloud utilities used by multiple baselines ---
+# (SiT, S3GM, and any future grid-based method). These live here rather than
+# in a method-specific script because they are pure data-layout helpers: no
+# loss, no sampler, no training loop.
 
 def set_seed(seed: int) -> None:
     """Seed numpy + torch (CPU & CUDA) for reproducible training runs."""

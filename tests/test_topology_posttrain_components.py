@@ -1,6 +1,6 @@
-"""Test output-mutual topology and local component balancing."""
+"""Focused gates for output-mutual topology and local component balancing."""
 
-# Support direct execution from any working directory.
+# Make src/ importable when run from any cwd.
 import os as _os
 import sys as _sys
 _SRC_DIR = _os.path.abspath(_os.path.join(
@@ -85,7 +85,7 @@ def test_output_mutual_gradients() -> None:
         assert float(grad[:, 0].abs().sum()) > 0.0, name
         assert float(grad[:, 2:4].abs().sum()) > 0.0, name
 
-    # The combined filtration is the mean of both directions.
+    # ``both`` is an average of the two filtration directions, not a sum.
     directional = {}
     for direction in ("super", "sub", "both"):
         directional_loss = DifferentiableTopologicalCoherenceLoss(
@@ -98,7 +98,7 @@ def test_output_mutual_gradients() -> None:
         expected = 0.5 * (directional["super"][name] + directional["sub"][name])
         assert torch.allclose(directional["both"][name], expected, rtol=1e-6, atol=1e-8), name
 
-    # The detached observed anchor does not update generated velocity.
+    # The legacy observed anchor is detached and must not update generated velocity.
     observed_cfg = _output_cfg(
         n, output_mutual_h0_weight=0.0, output_mutual_h1_weight=0.0,
         output_mutual_spatial_weight=0.0, mutual_h0_weight=0.0,
@@ -146,7 +146,7 @@ def test_component_balancing_and_state() -> None:
     assert set(restored._component_scales) == {"small", "large"}
     assert all(torch.isfinite(v) for v in restored._component_scales.values())
 
-    # Nearby inputs retain finite norms without assuming estimator continuity.
+    # Nearby inputs keep finite norms; PH estimators need not be continuous.
     norms = []
     for delta in (0.0, 1e-4, -1e-4):
         q = (x.detach() + delta).requires_grad_()
@@ -157,7 +157,7 @@ def test_component_balancing_and_state() -> None:
 
 
 def test_mutual_curve_reduction_is_linewise() -> None:
-    """Verify that opposite slice errors do not cancel before squaring."""
+    """Opposite slice errors must not cancel before the squared loss."""
     from unittest.mock import patch
 
     first_pred = torch.tensor([[1.0]], requires_grad=True)

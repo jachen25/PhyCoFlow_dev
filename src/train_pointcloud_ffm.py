@@ -11,7 +11,7 @@ import math
 import os
 import hashlib
 from pathlib import Path
-from typing import Dict, Optional, Tuple, Sequence
+from typing import Dict, List, NamedTuple, Optional, Tuple, Sequence
 
 import h5py
 import numpy as np
@@ -59,6 +59,7 @@ from direct_coherence_loss import (
     apply_two_objective_update,
     choose_topo_indices,
     clean_estimate,
+    clean_estimate_random_rollout_step,
     clean_estimate_rollout,
     data_and_anchor_losses,
 )
@@ -67,11 +68,9 @@ def parse_args():
 
     p = argparse.ArgumentParser("Train a conditional point-cloud FFM.")
 
-    p.add_argument("--config", type=str,
-                   default=("Save_config/active_emulsion/"
-                            "config_pointcloud_ffm_N12_piv_param.yaml"),
-                   help="Path to YAML config")
-    p.add_argument("--Demo-Num", type=int,
+    p.add_argument("--config", type=str, 
+                   default="Save_config/config_pointcloud_ffm.yaml", help="Path to YAML config")
+    p.add_argument("--Demo-Num", type=int, 
                    default=0, help="Demo ID tag for saving directories")
     p.add_argument("--device-ids", type=int, nargs="+", default=[0])
 
@@ -164,19 +163,19 @@ def parse_args():
     p.add_argument("--rbf-sigma", type=float, default=0.05)
 
     # Perceiver and GL_rbf widths.
-    p.add_argument("--latent-dim", type=int, default=256,
+    p.add_argument("--latent-dim", type=int, default=256, 
                    help="Token / latent width for the Perceiver backbone.",)
-    p.add_argument("--num-latents", type=int, default=128,
+    p.add_argument("--num-latents", type=int, default=128, 
                    help="Number of learned latent slots in the Perceiver.",)
-    p.add_argument("--num-heads", type=int, default=8,
+    p.add_argument("--num-heads", type=int, default=8, 
                    help="Number of attention heads for Perceiver attention blocks.",)
-    p.add_argument("--num-latent-blocks", type=int, default=4,
+    p.add_argument("--num-latent-blocks", type=int, default=4, 
                    help="Number of latent self-attention blocks.",)
-    p.add_argument("--ff-mult", type=int, default=4,
+    p.add_argument("--ff-mult", type=int, default=4, 
                    help="Expansion factor for Transformer feed-forward layers.",)
-    p.add_argument("--attn-dropout", type=float, default=0.0,
+    p.add_argument("--attn-dropout", type=float, default=0.0, 
                    help="Dropout used inside attention layers.",)
-    p.add_argument("--mlp-dropout", type=float, default=0.0,
+    p.add_argument("--mlp-dropout", type=float, default=0.0, 
                    help="Dropout used inside token projection / FFN layers.",)
     p.add_argument("--decode-chunk-size", type=int, default=4096,
                    help="Chunk size for Perceiver output decoding. Useful for full-resolution reconstruction.",)
@@ -192,7 +191,7 @@ def parse_args():
         help="Gather mode used by ConditionalPointHybridLocalGlobalRBF. 'rbf' preserves the current full gather as default.",
     )
     p.add_argument(
-        "--gather-topk", type=int, default=32,
+        "--gather-topk", type=int, default=32, 
         help="Number of nearest refined sensor tokens used in top-k gather modes "
              "(per physical field when fieldwise_rbf_gather is enabled).",
     )
@@ -220,8 +219,8 @@ def parse_args():
     p.add_argument(
         "--periodic-coord-periods", type=float, nargs="+", default=None,
         help="One period per model-coordinate dimension (0 = non-periodic). "
-             "Periodic dimensions use exact minimum-image distance; length "
-             "must equal coord_dim.",
+             "Periodic dimensions use a seam-continuous circular distance; "
+             "length must equal coord_dim.",
     )
     p.add_argument(
         "--adaptive-rbf-sigma", action="store_true",
@@ -373,26 +372,34 @@ def parse_args():
         default=False,
         help="For datasets with nonlinear field transforms, average pooled "
              "blocks in raw physical units and normalize the block mean "
-             "afterward. Active Emulsion N19 uses this idealized PIV-window "
-             "proxy; the default preserves legacy model-space pooling.",
+             "afterward. Active Emulsion N19 uses this for literal PIV means; "
+             "the default preserves legacy model-space pooling.",
     )
 
-    # Pooled block means are not pointwise targets. Keep smooth endpoint
-    # guidance available only as an explicit visualization diagnostic.
+    # Training-time reconstruction sampling. Pooled block means are not
+    # pointwise targets, so their centralized default is raw conditional
+    # sampling. These flags retain an explicit opt-in for diagnostic guidance.
     p.add_argument("--vis-obs-consistency-mode", type=str, default=None,
                    choices=["none", "default_hard", "endpoint", "endpoint_smooth"],
-                   help="Consistency mode for training reconstruction panels. "
-                        "Defaults to 'none' for pooled observations and "
-                        "'default_hard' otherwise.")
-    p.add_argument("--vis-obs-consistency-strength", type=float, default=1.0)
-    p.add_argument("--vis-obs-consistency-sigma", type=float, default=None)
-    p.add_argument("--vis-obs-consistency-schedule-power", type=float, default=2.0)
+                   help="Observation-consistency mode for training-time recon "
+                        "panels. Default: 'none' when obs_grid_pool is on "
+                        "(pooled block means have no valid pointwise target), "
+                        "else 'default_hard'.")
+    p.add_argument("--vis-obs-consistency-strength", type=float, default=1.0,
+                   help="Guidance strength for the viz sampler.")
+    p.add_argument("--vis-obs-consistency-sigma", type=float, default=None,
+                   help="Gaussian sigma for endpoint_smooth guidance in the "
+                        "viz sampler. Should be >= the coarse-observation cell "
+                        "size (stride/(N-1)) or the guidance map itself is "
+                        "lattice-bumpy. Default 0.05 (helpers default).")
+    p.add_argument("--vis-obs-consistency-schedule-power", type=float, default=2.0,
+                   help="Guidance decay exponent for the viz sampler.")
 
     p.add_argument("--vis-cond-fields", type=int, nargs="+", default=None,
                    help="Visualization conditioned fields. Defaults to cond_fields.")
     p.add_argument("--vis-n-obs-list", type=int, nargs="+", default=None,
                    help="Visualization exact sensors per field. Defaults to n_obs_max_list.")
-
+    
     # Generation.
     p.add_argument(
         "--ode-solver", type=str, default="euler",
@@ -469,9 +476,13 @@ def parse_args():
     p.add_argument("--gradient-diagnostics-every-n-steps", type=int, default=100,
                    help="Measure separate data/topology gradients every N global steps; "
                         "the first active step each epoch is always measured (0 disables).")
-    # Constrained post-training minimizes topology loss under RF-data and
-    # frozen-model anchor budgets. Adam updates the model while projected dual
-    # ascent updates the two constraint multipliers.
+    # Constrained topology post-training:
+    #   min L_topo  s.t.  L_data <= eps_d,  L_anchor <= eps_a
+    # optimized primal-dual — Adam on theta, projected dual ascent on the two
+    # multipliers (Cotter et al., JMLR 2019; Chamon & Ribeiro, 2020). The
+    # anchor is the function-space distance E||v_theta - v_base||^2 to the
+    # frozen pretrained model (L2-SP / RLHF-KL style). It bounds drift in the
+    # null space of the data loss, which no loss-budget constraint can see.
     p.add_argument("--topo-objective-mode", type=str, default="weighted_sum",
                    choices=["weighted_sum", "constrained"],
                    help="How the topology term enters training: legacy weighted_sum "
@@ -495,17 +506,29 @@ def parse_args():
     p.add_argument("--topo-rollout-backprop-k", type=int, default=0,
                    help="Backprop through only the last K rollout steps (DRaFT-K); "
                         "0 = full-depth backprop (legacy).")
-    # Validation guard for RF feasibility; the anchor constraint controls
-    # stepwise drift in constrained mode.
-    p.add_argument("--val-rf-guard", action=_bool, default=True,
-                   help="Disable the topology term permanently if held-out RF loss "
-                        "exceeds the Pareto feasibility limit (requires the Pareto "
-                        "RF baseline).")
-    p.add_argument("--val-rf-guard-patience", type=int, default=1,
-                   help="Consecutive infeasible validation evals before the val-RF "
-                        "guard trips.")
+    p.add_argument("--topo-rollout-gradient-mode", type=str, default="last_k",
+                   choices=["last_k", "random_step"],
+                   help="Topology training gradient path: truncated last-K rollout or a "
+                        "ReFL-style endpoint estimate at one random trajectory step.")
     p.add_argument("--gradient-clip-norm", type=float, default=1.0,
                    help="Global model-gradient norm limit; non-positive disables clipping.")
+    p.add_argument("--topo-normalize-constrained-gradient", action=_bool, default=False,
+                   help="In constrained mode, normalize the topology gradient to a "
+                        "scheduled fraction of the raw data-gradient norm before summing.")
+    p.add_argument("--topo-gradient-ratio-start", type=float, default=0.25,
+                   help="Initial ||g_topo|| / ||g_data|| target for normalized constrained updates.")
+    p.add_argument("--topo-gradient-ratio-end", type=float, default=0.05,
+                   help="Final ||g_topo|| / ||g_data|| target after the decay window.")
+    p.add_argument("--topo-gradient-ratio-decay-epochs", type=int, default=1000,
+                   help="Cosine-decay duration for the normalized topology-gradient ratio.")
+    p.add_argument("--topo-stratified-train-batches", action=_bool, default=False,
+                   help="Construct every training batch with at least one example from "
+                        "each marginal topology stratum (with rare-stratum oversampling).")
+    p.add_argument("--topo-stratified-val-batches", action=_bool, default=False,
+                   help="Evaluate topology on a deterministic, equally stratified validation cohort.")
+    p.add_argument("--topo-min-train-strata", type=int, default=0,
+                   help="Fail an active topology step unless at least this many distinct "
+                        "strata are present (0 disables the guard).")
 
     # Gradient balancing.
     p.add_argument("--gradient-balance-mode", type=str, default="weighted_sum",
@@ -555,6 +578,10 @@ def parse_args():
                    help="[betti_self_mutual] weight of the per-field H0 (components) Betti term.")
     p.add_argument("--topo-self-h1-weight", dest="topo_self_h1_weight", type=float, default=1.0,
                    help="[betti_self_mutual] weight of the per-field H1 (loops) Betti term.")
+    p.add_argument("--topo-self-persistence-h0-weight", type=float, default=0.0,
+                   help="Physical self H0 persistence-diagram matching weight.")
+    p.add_argument("--topo-self-persistence-h1-weight", type=float, default=0.0,
+                   help="Physical self H1 persistence-diagram matching weight.")
     p.add_argument("--topo-mutual-h0-weight", dest="topo_mutual_h0_weight", type=float, default=1.0,
                    help="[betti_self_mutual] weight of the cross-field H0 fibered-barcode term.")
     p.add_argument("--topo-mutual-h1-weight", dest="topo_mutual_h1_weight", type=float, default=1.0,
@@ -598,6 +625,20 @@ def parse_args():
     p.add_argument("--topo-output-mutual-spatial-weight",
                    dest="topo_output_mutual_spatial_weight", type=float, default=0.0,
                    help="Generated-output spatial relationship weight.")
+    p.add_argument("--topo-output-mutual-persistence-h0-weight", type=float, default=0.0,
+                   help="Generated phi-vorticity sliced H0 persistence matching weight.")
+    p.add_argument("--topo-output-mutual-persistence-h1-weight", type=float, default=0.0,
+                   help="Generated phi-vorticity sliced H1 persistence matching weight.")
+    p.add_argument("--topo-persistence-train-batch-size", type=int, default=0,
+                   help="Rotating comprehensive-training subset for CPU barcode matching; "
+                        "zero uses the full coherence batch.")
+    p.add_argument("--topo-persistence-eval-batch-size", type=int, default=0,
+                   help="Rotating comprehensive-validation subset for CPU barcode matching; "
+                        "zero uses the full validation batch.")
+    p.add_argument("--topo-output-mutual-curve-loss",
+                   dest="topo_output_mutual_curve_loss", choices=["mse", "nmae"],
+                   default="mse", help="Scale for generated mutual H0/H1 curve matching; "
+                   "nmae is dimensionless and recommended for composite objectives.")
     p.add_argument("--topo-matching-backend", dest="topo_matching_backend", type=str,
                    default="induced", choices=["induced", "lifted"],
                    help="Bar matching: 'induced' (Stucki) or 'lifted' (optimal partial "
@@ -788,11 +829,27 @@ def parse_args():
                    help="[topofix] clDice soft-skeleton connectivity weight.")
     p.add_argument("--topo-cross-dice-weight", dest="topo_cross_dice_weight", type=float, default=0.5,
                    help="[topofix] cross-field joint super-level Dice weight (phi<->flow co-placement).")
+    p.add_argument("--topo-superlevel-level-mode", dest="topo_superlevel_level_mode",
+                   choices=["reference_quantile", "physical"],
+                   default="reference_quantile",
+                   help="Use reference-quantile or fixed physical levels for paired overlap.")
+    p.add_argument("--topo-superlevel-physical-levels",
+                   dest="topo_superlevel_physical_levels", type=float, nargs="+", default=[],
+                   help="Fixed raw-field levels for physical paired super-level overlap.")
     p.add_argument("--val-coherence", dest="val_coherence",
                    action=argparse.BooleanOptionalAction, default=True,
                    help="Evaluate the topology objective on held-out validation data.")
     p.add_argument("--val-coherence-batches", dest="val_coherence_batches", type=int, default=4,
                    help="Val batches for the coherence probe (topo loss is ~0.4-1.8 s/snapshot).")
+    p.add_argument("--val-coherence-rollout-steps", dest="val_coherence_rollout_steps",
+                   type=int, default=0,
+                   help="ODE steps for topology validation (0 uses epi_rollout_steps).")
+    p.add_argument("--topo-exact-betti-validation", dest="topo_exact_betti_validation",
+                   action=_bool, default=False,
+                   help="Also compute exact physical H0/H1 curve error for validation/Pareto selection.")
+    p.add_argument("--topo-exact-mutual-validation", dest="topo_exact_mutual_validation",
+                   action=_bool, default=False,
+                   help="Also compute exact generated phi-vorticity H0/H1 and spatial error.")
     p.add_argument("--pareto-selection-enabled", dest="pareto_selection_enabled",
                    action=argparse.BooleanOptionalAction, default=False,
                    help="Select the lowest validation topology loss within an RF-loss budget.")
@@ -805,6 +862,22 @@ def parse_args():
     p.add_argument("--pareto-rf-baseline", dest="pareto_rf_baseline", type=float,
                    default=None,
                    help="Fixed RF validation baseline; unset measures the frozen source once.")
+    p.add_argument("--pareto-require-topology-improvement",
+                   dest="pareto_require_topology_improvement",
+                   action=_bool, default=False,
+                   help="Require a candidate to beat the frozen source's topology metric, "
+                        "in addition to satisfying the RF budget.")
+    p.add_argument("--pareto-topology-guard-metrics", nargs="*", default=[],
+                   help="Additional topology metrics that every selected candidate must keep "
+                        "within tolerance of the frozen source.")
+    p.add_argument("--pareto-topology-guard-relative-tolerance", type=float, default=0.0,
+                   help="Relative non-regression tolerance for every topology guard metric.")
+    p.add_argument("--pareto-topology-guard-absolute-tolerance", type=float, default=0.0,
+                   help="Absolute floor on the non-regression tolerance for guard metrics.")
+    p.add_argument("--topology-go-no-go-epoch", dest="topology_go_no_go_epoch",
+                   type=int, default=0,
+                   help="At or after this snapshot epoch, stop if no RF-feasible topology "
+                        "improvement exists (0 disables the early gate).")
     p.add_argument("--topo-skeleton-sharpness", dest="topo_skeleton_sharpness", type=float, default=16.0,
                    help="[topofix/bitopo] Separate clDice mask sharpness.")
     p.add_argument("--topo-skeleton-iters", dest="topo_skeleton_iters", type=int, default=6,
@@ -855,29 +928,33 @@ def parse_args():
 
     return p.parse_args()
 
-
 def _vis_obs_consistency_kwargs(args) -> dict:
-    """Sampling controls for training-time reconstruction panels.
+    """Sampling controls for the training-time reconstruction panels.
 
-    A pooled block mean is not a field value at any one pixel. Raw conditional
-    sampling therefore avoids re-imprinting the coarse lattice through either
-    a point clamp or a Gaussian endpoint-guidance map.
+    Pooled observations default to 'none': a block mean is not the field value
+    at any pixel, so there is no valid pointwise target to project onto, and
+    endpoint_smooth's dense guidance map is built by Gaussian-interpolating the
+    coarse values at EVERY query point — with sigma below the observation
+    spacing that map is lattice-bumpy and its blend weight swings periodically,
+    which shows up as blockiness in the generated field. The conditioning
+    already reaches the network through the sensor tokens.
     """
     pooled = bool(getattr(args, "obs_grid_pool", False))
     mode = getattr(args, "vis_obs_consistency_mode", None)
     if mode is None:
         mode = "none" if pooled else "default_hard"
-    kwargs = {
-        "obs_consistency_mode": str(mode),
-        "obs_consistency_strength": float(
+    kw = dict(
+        obs_consistency_mode=str(mode),
+        obs_consistency_strength=float(
             getattr(args, "vis_obs_consistency_strength", 1.0)),
-        "obs_consistency_schedule_power": float(
+        obs_consistency_schedule_power=float(
             getattr(args, "vis_obs_consistency_schedule_power", 2.0)),
-    }
+    )
     sigma = getattr(args, "vis_obs_consistency_sigma", None)
     if sigma is not None:
-        kwargs["obs_consistency_sigma"] = float(sigma)
-    return kwargs
+        kw["obs_consistency_sigma"] = float(sigma)
+    return kw
+
 
 def set_seed(seed: int) -> None:
     np.random.seed(seed)
@@ -1108,6 +1185,73 @@ def resolve_stride_grid(obs_grid_strides, dataset,
     return int(grid_shape[0]), int(grid_shape[1])
 
 
+class RFBatch(NamedTuple):
+    """One device-resident batch prepared for a rectified-flow step."""
+    coords_full: torch.Tensor
+    fields_full: torch.Tensor
+    coords_q: torch.Tensor
+    fields_q: torch.Tensor
+    obs_coords: torch.Tensor
+    obs_values: torch.Tensor
+    obs_mask: torch.Tensor
+    obs_indices: Optional[torch.Tensor]
+    obs_field_ids: torch.Tensor
+    params: Optional[torch.Tensor]
+
+    def loss_kwargs(self) -> dict:
+        """Keyword arguments for training_loss / data_and_anchor_losses."""
+        return dict(
+            x1=self.fields_q, coords=self.coords_q, obs_coords=self.obs_coords,
+            obs_values=self.obs_values, obs_mask=self.obs_mask,
+            obs_field_ids=self.obs_field_ids,
+            **({} if self.params is None else {"params": self.params}))
+
+
+def prepare_rf_batch(batch, model, device, *, cond_fields, n_obs_min_list,
+                     n_obs_max_list, n_query_points, sensor_layout,
+                     grid_ny, grid_nx, obs_grid_strides, obs_grid_pool,
+                     pool_value_transform) -> RFBatch:
+    """Move one batch to the device and build its observations and queries.
+
+    SINGLE SOURCE for the conditioning protocol: the baseline loop, the
+    post-training loop, and deterministic validation all prepare batches here,
+    so their sensor/query construction cannot drift apart. The draw order
+    (sensors, then queries) is part of the treatment/control RNG-coupling
+    contract; do not reorder.
+    """
+    coords_full = batch["coords"].to(device)
+    fields_full = batch["fields"].to(device)
+
+    # Restrict sensors to dataset-valid regions when provided.
+    valid_mask = batch.get("valid_sensor_mask")
+    if valid_mask is not None:
+        valid_mask = valid_mask.to(device)
+
+    obs_coords, obs_values, obs_mask, obs_indices, obs_field_ids = build_sparse_condition(
+        coords_full=coords_full,
+        fields_full=fields_full,
+        cond_fields=cond_fields,
+        n_obs_min=n_obs_min_list,
+        n_obs_max=n_obs_max_list,
+        valid_mask=valid_mask,
+        sensor_layout=sensor_layout,
+        Ny=grid_ny,
+        Nx=grid_nx,
+        obs_grid_strides=obs_grid_strides,
+        obs_grid_pool=obs_grid_pool,
+        pool_value_transform=pool_value_transform,
+    )
+
+    # Full-grid models cannot subsample query points.
+    effective_n_query = None if getattr(model, "requires_full_grid", False) else n_query_points
+    coords_q, fields_q, _ = random_query_subset(coords_full, fields_full, effective_n_query)
+
+    params = batch_params(batch, model, device)
+    return RFBatch(coords_full, fields_full, coords_q, fields_q,
+                   obs_coords, obs_values, obs_mask, obs_indices,
+                   obs_field_ids, params)
+
+
 def run_epoch(
     model: nn.Module,
     loader: DataLoader,
@@ -1143,45 +1287,21 @@ def run_epoch(
     pbar = tqdm(loader, desc=f"Epoch {epoch:04d} [{mode_str}]", leave=False)
 
     for batch in pbar:
-        coords_full = batch["coords"].to(device)
-        fields_full = batch["fields"].to(device)
-
-        # Restrict sensors to dataset-valid regions when provided.
-        valid_mask = batch.get("valid_sensor_mask")
-        if valid_mask is not None:
-            valid_mask = valid_mask.to(device)
-
-        # Build sparse observations.
-        obs_coords, obs_values, obs_mask, obs_indices, obs_field_ids = build_sparse_condition(
-            coords_full=coords_full,
-            fields_full=fields_full,
+        rb = prepare_rf_batch(
+            batch, model, device,
             cond_fields=cond_fields,
-            n_obs_min=n_obs_min_list,
-            n_obs_max=n_obs_max_list,
-            valid_mask=valid_mask,
+            n_obs_min_list=n_obs_min_list,
+            n_obs_max_list=n_obs_max_list,
+            n_query_points=n_query_points,
             sensor_layout=sensor_layout,
-            Ny=grid_ny,
-            Nx=grid_nx,
+            grid_ny=grid_ny,
+            grid_nx=grid_nx,
             obs_grid_strides=obs_grid_strides,
             obs_grid_pool=obs_grid_pool,
             pool_value_transform=pool_value_transform,
         )
-
-        # Full-grid models cannot subsample query points.
-        effective_n_query = None if getattr(model, "requires_full_grid", False) else n_query_points
-        coords_q, fields_q, _ = random_query_subset(coords_full, fields_full, effective_n_query)
-
-        params = batch_params(batch, model, device)
         loss, _ = model.training_loss(
-            x1=fields_q,
-            coords=coords_q,
-            obs_coords=obs_coords,
-            obs_values=obs_values,
-            obs_mask=obs_mask,
-            obs_field_ids=obs_field_ids,
-            obs_indices=obs_indices,
-            **({} if params is None else {"params": params}),
-        )
+            obs_indices=rb.obs_indices, **rb.loss_kwargs())
 
         if training:
             optimizer.zero_grad(set_to_none=True)
@@ -1425,6 +1545,10 @@ def build_topo_direct_coherence_config(args) -> TopoDirectCoherenceConfig:
         dice_weight=float(getattr(args, "topo_dice_weight", 1.0)),
         cldice_weight=float(getattr(args, "topo_cldice_weight", 1.0)),
         cross_dice_weight=float(getattr(args, "topo_cross_dice_weight", 0.5)),
+        superlevel_level_mode=str(getattr(
+            args, "topo_superlevel_level_mode", "reference_quantile")),
+        superlevel_physical_levels=tuple(float(v) for v in getattr(
+            args, "topo_superlevel_physical_levels", ())),
         skeleton_sharpness=(None if getattr(args, "topo_skeleton_sharpness", 16.0) is None
                      else float(getattr(args, "topo_skeleton_sharpness", 16.0))),
         skeleton_iters=int(getattr(args, "topo_skeleton_iters", 6)),
@@ -1460,6 +1584,10 @@ def build_topo_direct_coherence_config(args) -> TopoDirectCoherenceConfig:
         # Unified self/mutual Betti objective.
         self_h0_weight=float(getattr(args, "topo_self_h0_weight", 1.0)),
         self_h1_weight=float(getattr(args, "topo_self_h1_weight", 1.0)),
+        self_persistence_h0_weight=float(getattr(
+            args, "topo_self_persistence_h0_weight", 0.0)),
+        self_persistence_h1_weight=float(getattr(
+            args, "topo_self_persistence_h1_weight", 0.0)),
         mutual_h0_weight=float(getattr(args, "topo_mutual_h0_weight", 1.0)),
         mutual_h1_weight=float(getattr(args, "topo_mutual_h1_weight", 1.0)),
         self_h0_create_weight=float(getattr(args, "topo_self_h0_create_weight", 0.0)),
@@ -1483,6 +1611,16 @@ def build_topo_direct_coherence_config(args) -> TopoDirectCoherenceConfig:
             args, "topo_output_mutual_h1_weight", 0.0)),
         output_mutual_spatial_weight=float(getattr(
             args, "topo_output_mutual_spatial_weight", 0.0)),
+        output_mutual_persistence_h0_weight=float(getattr(
+            args, "topo_output_mutual_persistence_h0_weight", 0.0)),
+        output_mutual_persistence_h1_weight=float(getattr(
+            args, "topo_output_mutual_persistence_h1_weight", 0.0)),
+        output_mutual_curve_loss=str(getattr(
+            args, "topo_output_mutual_curve_loss", "mse")),
+        persistence_train_batch_size=int(getattr(
+            args, "topo_persistence_train_batch_size", 0)),
+        persistence_eval_batch_size=int(getattr(
+            args, "topo_persistence_eval_batch_size", 0)),
         matching_backend=str(getattr(args, "topo_matching_backend", "induced")),
         lambda_spatial_self=float(getattr(args, "topo_lambda_spatial_self", 0.0)),
         lambda_spatial_mutual=float(getattr(args, "topo_lambda_spatial_mutual", 0.0)),
@@ -1541,7 +1679,14 @@ def constrained_mode_active(args) -> bool:
 
 
 def topo_dual_state(args) -> dict:
-    """Return checkpointed multipliers and smoothed constraint losses."""
+    """Multipliers and smoothed constraint losses for the constrained mode.
+
+    Persisted in checkpoints. mu_data starts at 1 so the first updates match
+    plain data training; mu_anchor starts at 0 because the anchor loss starts
+    at exactly 0 (the model equals the base). topo_norm is the topology loss at
+    the first topology step, used as a constant normalizer so the objective is
+    O(1) (a fixed rescale, not an adaptive controller).
+    """
     state = getattr(args, "_topo_dual_state", None)
     if state is None:
         state = {"mu_data": 1.0, "mu_anchor": 0.0,
@@ -1551,7 +1696,14 @@ def topo_dual_state(args) -> dict:
 
 
 def update_topo_duals(args, data_loss_value: float, anchor_loss_value: float) -> None:
-    """Apply projected dual ascent using budget-normalized EMA violations."""
+    """One projected dual-ascent step: mu <- clip(mu + lr * (EMA(L) - eps) / eps).
+
+    A violated budget grows its multiplier until the constraint is restored; a
+    slack budget decays it toward zero; at a constrained optimum the
+    multipliers persist at the level that holds the solution (complementary
+    slackness). Violations are normalized by their budgets so ``dual_lr`` is
+    unit-free.
+    """
     state = topo_dual_state(args)
     decay = float(getattr(args, "dual_loss_ema_decay", 0.95))
     if not (0.0 <= decay < 1.0):
@@ -1572,55 +1724,64 @@ def update_topo_duals(args, data_loss_value: float, anchor_loss_value: float) ->
         0.0), mu_max)
 
 
-def topo_guard_state(args) -> dict:
-    """Val-RF early-stopping state; persisted in checkpoints for exact resume."""
-    state = getattr(args, "_topo_guard_state", None)
-    if state is None:
-        state = {
-            "val_guard_strikes": 0,
-            "coherence_disabled": False,
-            "disabled_reason": None,
-            "disabled_epoch": None,
-        }
-        setattr(args, "_topo_guard_state", state)
-    return state
+def _dataset_stratum_labels(dataset, key: str) -> Optional[List[str]]:
+    """Return one topology-stratum label per dataset item when metadata permits."""
+    if isinstance(dataset, Subset):
+        base = _dataset_stratum_labels(dataset.dataset, key)
+        return None if base is None else [base[int(i)] for i in dataset.indices]
+    metadata = getattr(dataset, "_meta", None)
+    if metadata is None or len(metadata) != len(dataset):
+        return None
+    key_fn = getattr(type(dataset), "stratum_keys", None)
+    labels: List[str] = []
+    for item in metadata:
+        try:
+            value = key_fn(item)[key] if callable(key_fn) else item[key]
+        except (KeyError, TypeError):
+            return None
+        labels.append(str(value))
+    return labels
 
 
-def _disable_topo_term(args, state: dict, epoch: int, reason: str) -> None:
-    state["coherence_disabled"] = True
-    state["disabled_reason"] = reason
-    state["disabled_epoch"] = int(epoch)
-    # Disable both fixed-weight and constrained topology paths.
-    args.coherence_loss_weight = 0.0
-    print(f"[topo-guard] epoch={epoch}: TOPOLOGY TERM DISABLED for the rest of "
-          f"this run ({reason}). Training continues data-only; treat this arm's "
-          f"later epochs as control-equivalent.", flush=True)
+def _stratified_epoch_batches(train_set, args, epoch: int,
+                              n_epoch: int) -> List[List[int]]:
+    """Build deterministic batches covering every marginal stratum.
 
-
-def update_val_rf_guard(args, epoch: int, val_loss: float,
-                        rf_baseline: Optional[float]) -> None:
-    """Disable topology updates after repeated validation RF violations."""
-    if not bool(getattr(args, "val_rf_guard", True)):
-        return
-    if rf_baseline is None or not math.isfinite(float(rf_baseline)):
-        return
-    state = topo_guard_state(args)
-    if state["coherence_disabled"]:
-        return
-    tolerance = float(getattr(args, "pareto_rf_relative_tolerance", 0.02))
-    limit = float(rf_baseline) + tolerance * max(abs(float(rf_baseline)), 1e-12)
-    if float(val_loss) <= limit:
-        state["val_guard_strikes"] = 0
-        return
-    state["val_guard_strikes"] = int(state["val_guard_strikes"]) + 1
-    patience = max(1, int(getattr(args, "val_rf_guard_patience", 1)))
-    print(f"[val-guard] epoch={epoch}: held-out RF {float(val_loss):.6e} exceeds "
-          f"the Pareto feasibility limit {limit:.6e} "
-          f"(strike {state['val_guard_strikes']}/{patience})", flush=True)
-    if state["val_guard_strikes"] >= patience:
-        _disable_topo_term(
-            args, state, epoch,
-            f"held-out RF {float(val_loss):.6e} > feasibility limit {limit:.6e}")
+    Rare strata are intentionally oversampled. This is preferable to silently
+    estimating a twelve-stratum marginal objective from whichever four strata
+    happen to occur in an ordinary shuffled batch.
+    """
+    key = str(getattr(args, "topo_marginal_stratify_key", "regime"))
+    labels = _dataset_stratum_labels(train_set, key)
+    if labels is None:
+        raise RuntimeError(
+            f"topo_stratified_train_batches=true but dataset metadata cannot emit {key!r}")
+    groups: Dict[str, List[int]] = {}
+    for index, label in enumerate(labels):
+        groups.setdefault(label, []).append(index)
+    batch_size = int(args.batch_size)
+    if batch_size < len(groups):
+        raise ValueError(
+            f"batch_size={batch_size} cannot cover all {len(groups)} {key!r} strata")
+    generator = torch.Generator().manual_seed(int(args.seed) + int(epoch) * 1009)
+    n_batches = max(1, int(math.ceil(n_epoch / batch_size)))
+    batches: List[List[int]] = []
+    group_names = sorted(groups)
+    for _ in range(n_batches):
+        batch = []
+        quota = batch_size // len(group_names)
+        for name in group_names:
+            members = groups[name]
+            offsets = torch.randint(
+                len(members), (quota,), generator=generator).tolist()
+            batch.extend(members[offset] for offset in offsets)
+        fill = batch_size - len(batch)
+        if fill > 0:
+            batch.extend(torch.randint(
+                len(train_set), (fill,), generator=generator).tolist())
+        order = torch.randperm(len(batch), generator=generator).tolist()
+        batches.append([batch[i] for i in order])
+    return batches
 
 
 def build_epoch_train_loader(train_set, args, epoch: int) -> DataLoader:
@@ -1630,6 +1791,11 @@ def build_epoch_train_loader(train_set, args, epoch: int) -> DataLoader:
     n_epoch = n_total if ratio >= 1.0 else max(1, int(math.ceil(n_total * ratio)))
     generator = torch.Generator()
     generator.manual_seed(int(args.seed) + int(epoch) * 1009)
+    if bool(getattr(args, "topo_stratified_train_batches", False)):
+        batches = _stratified_epoch_batches(train_set, args, epoch, n_epoch)
+        return DataLoader(
+            train_set, batch_sampler=batches, num_workers=args.num_workers,
+            pin_memory=torch.cuda.is_available(), collate_fn=collate_snapshots)
     if n_epoch < n_total:
         indices = torch.randperm(n_total, generator=generator)[:n_epoch].tolist()
         epoch_set = Subset(train_set, indices)
@@ -1688,6 +1854,124 @@ def _objective_gradient_stats(model: nn.Module, data_loss: torch.Tensor,
     }
 
 
+def _topology_gradient_ratio(args, epoch: int) -> float:
+    """Cosine-decayed topology/data gradient-norm target."""
+    start = float(getattr(args, "topo_gradient_ratio_start", 0.25))
+    end = float(getattr(args, "topo_gradient_ratio_end", 0.05))
+    duration = int(getattr(args, "topo_gradient_ratio_decay_epochs", 1000))
+    if start < 0.0 or end < 0.0:
+        raise ValueError("topology gradient ratios must be non-negative")
+    if duration <= 0:
+        return end
+    progress = min(max((int(epoch) - 1) / float(duration), 0.0), 1.0)
+    blend = 0.5 * (1.0 + math.cos(math.pi * progress))
+    return end + (start - end) * blend
+
+
+def _normalized_constrained_update(
+        model: nn.Module, optimizer, data_loss: torch.Tensor,
+        anchor_loss: torch.Tensor, topology_loss: torch.Tensor,
+        mu_data: float, mu_anchor: float, target_ratio: float,
+        grad_clip_norm: Optional[float] = None) -> Dict[str, float]:
+    """Apply a constrained update with topology normalized to data scale.
+
+    Raw gradients are measured every active step. The topology gradient is
+    rescaled to ``target_ratio * ||g_data||`` before adding the dual-weighted
+    data and anchor constraint gradients. This preserves magnitude information
+    for instrumentation while preventing a norm-2000 surrogate gradient from
+    being reduced to an arbitrary unit vector by global clipping.
+    """
+    params = [p for p in model.parameters() if p.requires_grad]
+    if not params:
+        raise RuntimeError("No trainable parameters found for constrained update")
+
+    def gradients(loss: torch.Tensor, retain_graph: bool):
+        if not loss.requires_grad:
+            return [None] * len(params)
+        return torch.autograd.grad(
+            loss, params, retain_graph=retain_graph, allow_unused=True)
+
+    g_data = gradients(data_loss, True)
+    g_topo = gradients(topology_loss, True)
+    g_anchor = gradients(anchor_loss, False)
+
+    def norm_sq(grads):
+        value = data_loss.new_zeros((), dtype=torch.float32)
+        for grad in grads:
+            if grad is not None:
+                value = value + grad.detach().float().square().sum()
+        return value
+
+    def dot(left, right):
+        value = data_loss.new_zeros((), dtype=torch.float32)
+        for a, b in zip(left, right):
+            if a is not None and b is not None:
+                value = value + (a.detach().float() * b.detach().float()).sum()
+        return value
+
+    data_n2, topo_n2, anchor_n2 = (
+        norm_sq(g_data), norm_sq(g_topo), norm_sq(g_anchor))
+    data_norm = data_n2.sqrt()
+    topo_norm = topo_n2.sqrt()
+    anchor_norm = anchor_n2.sqrt()
+    if not torch.isfinite(data_norm) or not torch.isfinite(topo_norm) \
+            or not torch.isfinite(anchor_norm):
+        raise FloatingPointError(
+            "non-finite raw objective gradient in normalized constrained update")
+    if float(topo_norm) <= 0.0:
+        raise RuntimeError("topology objective produced a zero parameter gradient")
+    topology_scale = (float(target_ratio) * data_norm / topo_norm.clamp_min(1e-12))
+
+    constraint_grads = []
+    combined_grads = []
+    scaled_topo_grads = []
+    for gd, ga, gt, param in zip(g_data, g_anchor, g_topo, params):
+        zero = torch.zeros_like(param)
+        gd_v = zero if gd is None else gd.detach()
+        ga_v = zero if ga is None else ga.detach()
+        gt_v = zero if gt is None else gt.detach()
+        constraint = float(mu_data) * gd_v + float(mu_anchor) * ga_v
+        scaled_topo = topology_scale.to(dtype=gt_v.dtype) * gt_v
+        constraint_grads.append(constraint)
+        scaled_topo_grads.append(scaled_topo)
+        combined_grads.append(constraint + scaled_topo)
+
+    combined_n2 = norm_sq(combined_grads)
+    combined_norm = float(combined_n2.sqrt().cpu())
+    if not math.isfinite(combined_norm):
+        raise FloatingPointError("combined normalized gradient is not finite")
+    optimizer.zero_grad(set_to_none=True)
+    for param, grad in zip(params, combined_grads):
+        param.grad = grad.to(dtype=param.dtype)
+    if grad_clip_norm is not None and float(grad_clip_norm) > 0.0:
+        nn.utils.clip_grad_norm_(params, max_norm=float(grad_clip_norm))
+    optimizer.step()
+
+    def cosine(left, right, left_n2=None, right_n2=None):
+        ln2 = norm_sq(left) if left_n2 is None else left_n2
+        rn2 = norm_sq(right) if right_n2 is None else right_n2
+        denom = (ln2.sqrt() * rn2.sqrt()).clamp_min(1e-12)
+        return float((dot(left, right) / denom).cpu()) \
+            if float(ln2) > 0.0 and float(rn2) > 0.0 else 0.0
+
+    constraint_n2 = norm_sq(constraint_grads)
+    return {
+        "raw_data_grad_norm": float(data_norm.cpu()),
+        "raw_coherence_grad_norm": float(topo_norm.cpu()),
+        "raw_anchor_grad_norm": float(anchor_norm.cpu()),
+        "gradient_cosine": cosine(g_data, g_topo, data_n2, topo_n2),
+        "topology_anchor_gradient_cosine": cosine(
+            g_topo, g_anchor, topo_n2, anchor_n2),
+        "topology_constraint_gradient_cosine": cosine(
+            g_topo, constraint_grads, topo_n2, constraint_n2),
+        "topology_gradient_scale": float(topology_scale.cpu()),
+        "topology_gradient_target_ratio": float(target_ratio),
+        "applied_topology_grad_norm": float(
+            norm_sq(scaled_topo_grads).sqrt().cpu()),
+        "combined_grad_norm": combined_norm,
+    }
+
+
 def _clip_metrics(pre_clip_norm: float, clip_norm: Optional[float]) -> Dict[str, float]:
     """Return deterministic global-clipping telemetry from the pre-clip norm."""
     pre = float(pre_clip_norm)
@@ -1727,7 +2011,7 @@ def _component_scalar(components: Dict[str, object], key: str) -> Optional[float
 
 def stratified_coherence_indices(labels: Sequence[object], batch_size: int,
                                  device: torch.device) -> torch.Tensor:
-    """Select a small topology batch with maximal stratum diversity."""
+    """Select a topology batch round-robin across strata."""
     n_items = len(labels)
     take = min(max(int(batch_size), 0), n_items)
     if take == 0:
@@ -1737,11 +2021,24 @@ def stratified_coherence_indices(labels: Sequence[object], batch_size: int,
         groups.setdefault(str(label), []).append(index)
     group_names = list(groups)
     group_order = torch.randperm(len(group_names), device=device).tolist()
+    shuffled_members = {
+        name: [groups[name][j] for j in torch.randperm(
+            len(groups[name]), device=device).tolist()]
+        for name in group_names}
     chosen: List[int] = []
-    for group_index in group_order[:take]:
-        candidates = groups[group_names[group_index]]
-        offset = int(torch.randint(len(candidates), (), device=device))
-        chosen.append(candidates[offset])
+    round_index = 0
+    while len(chosen) < take:
+        added = False
+        for group_index in group_order:
+            candidates = shuffled_members[group_names[group_index]]
+            if round_index < len(candidates):
+                chosen.append(candidates[round_index])
+                added = True
+                if len(chosen) == take:
+                    break
+        if not added:
+            break
+        round_index += 1
     if len(chosen) < take:
         selected = set(chosen)
         remaining = [index for index in range(n_items) if index not in selected]
@@ -1773,6 +2070,11 @@ def _expected_marginal_cells(direct_cfg, n_fields: int) -> int:
     # Output-mutual cells are counted once per active dimension by the loss.
     for dim, weight in ((0, getattr(direct_cfg, "output_mutual_h0_weight", 0.0)),
                         (1, getattr(direct_cfg, "output_mutual_h1_weight", 0.0))):
+        if dim in dims and float(weight) != 0.0:
+            total += 1
+    for dim, weight in (
+            (0, getattr(direct_cfg, "output_mutual_persistence_h0_weight", 0.0)),
+            (1, getattr(direct_cfg, "output_mutual_persistence_h1_weight", 0.0))):
         if dim in dims and float(weight) != 0.0:
             total += 1
     total += int(float(getattr(direct_cfg, "output_mutual_spatial_weight", 0.0)) != 0.0)
@@ -1813,6 +2115,8 @@ def _validate_topology_coverage(args, direct_cfg, components: Dict[str, object],
 
     output_mutual = any(float(getattr(direct_cfg, name, 0.0)) != 0.0 for name in (
         "output_mutual_h0_weight", "output_mutual_h1_weight",
+        "output_mutual_persistence_h0_weight",
+        "output_mutual_persistence_h1_weight",
         "output_mutual_spatial_weight"))
     if output_mutual:
         valid = _component_scalar(components, "output_mutual_valid_frac")
@@ -1912,7 +2216,7 @@ def build_marginal_reference_provenance(args, train_set,
 
 
 def _coherence_state_dict(topo_loss_fn) -> Optional[dict]:
-    """Read wrapper-owned state with a fallback for compatible loss objects."""
+    """Read wrapper-owned state with compatibility for older losses."""
     if topo_loss_fn is None:
         return None
     method = getattr(topo_loss_fn, "coherence_state_dict", None)
@@ -1943,7 +2247,12 @@ def _load_coherence_state(topo_loss_fn, state: Optional[dict]) -> bool:
 def update_pareto_selection(state: Optional[dict], *, epoch: int, rf_val: float,
                             topology_val: float, rf_tolerance: float,
                             topology_metric: str,
-                            rf_baseline: Optional[float] = None) -> dict:
+                            rf_baseline: Optional[float] = None,
+                            topology_baseline: Optional[float] = None,
+                            topology_guard_values: Optional[Dict[str, float]] = None,
+                            topology_guard_baselines: Optional[Dict[str, float]] = None,
+                            topology_guard_relative_tolerance: float = 0.0,
+                            topology_guard_absolute_tolerance: float = 0.0) -> dict:
     """Update a two-objective frontier and constrained topology selection."""
     rf_val = float(rf_val)
     topology_val = float(topology_val)
@@ -1954,16 +2263,48 @@ def update_pareto_selection(state: Optional[dict], *, epoch: int, rf_val: float,
         raise ValueError("pareto_rf_relative_tolerance must be non-negative")
     if rf_baseline is not None and not math.isfinite(float(rf_baseline)):
         raise ValueError("pareto_rf_baseline must be finite when provided")
+    if topology_baseline is not None and not math.isfinite(float(topology_baseline)):
+        raise ValueError("topology_baseline must be finite when provided")
+    guard_values = {str(k): float(v) for k, v in dict(
+        topology_guard_values or {}).items()}
+    guard_baselines = {str(k): float(v) for k, v in dict(
+        topology_guard_baselines or {}).items()}
+    guard_relative_tolerance = float(topology_guard_relative_tolerance)
+    guard_absolute_tolerance = float(topology_guard_absolute_tolerance)
+    if guard_relative_tolerance < 0.0 or guard_absolute_tolerance < 0.0:
+        raise ValueError("topology guard tolerances must be non-negative")
+    if set(guard_values) != set(guard_baselines):
+        raise ValueError(
+            "topology guard values and baselines must have identical metric names")
+    if any(not math.isfinite(v) for v in (*guard_values.values(), *guard_baselines.values())):
+        raise ValueError("topology guard metrics and baselines must be finite")
     if state:
         prior_metric = str(state.get("topology_metric", topology_metric))
         prior_tol = float(state.get("rf_relative_tolerance", tolerance))
         prior_baseline = state.get("configured_rf_baseline")
+        prior_topology_baseline = state.get("configured_topology_baseline")
+        prior_guard_baselines = {
+            str(k): float(v) for k, v in dict(
+                state.get("configured_topology_guard_baselines", {})).items()}
+        prior_guard_relative = float(state.get(
+            "topology_guard_relative_tolerance", guard_relative_tolerance))
+        prior_guard_absolute = float(state.get(
+            "topology_guard_absolute_tolerance", guard_absolute_tolerance))
         baseline_changed = not (
             prior_baseline is None and rf_baseline is None) and not (
                 prior_baseline is not None and rf_baseline is not None
                 and math.isclose(float(prior_baseline), float(rf_baseline)))
+        topology_baseline_changed = not (
+            prior_topology_baseline is None and topology_baseline is None) and not (
+                prior_topology_baseline is not None and topology_baseline is not None
+                and math.isclose(
+                    float(prior_topology_baseline), float(topology_baseline)))
         if (prior_metric != str(topology_metric)
-                or not math.isclose(prior_tol, tolerance) or baseline_changed):
+                or not math.isclose(prior_tol, tolerance) or baseline_changed
+                or topology_baseline_changed
+                or prior_guard_baselines != guard_baselines
+                or not math.isclose(prior_guard_relative, guard_relative_tolerance)
+                or not math.isclose(prior_guard_absolute, guard_absolute_tolerance)):
             raise RuntimeError(
                 "Pareto settings changed across resume; keep topology metric and RF "
                 "tolerance fixed or start a new run.")
@@ -1975,6 +2316,7 @@ def update_pareto_selection(state: Optional[dict], *, epoch: int, rf_val: float,
         "rf_val_loss": rf_val,
         "topology_val": topology_val,
         "checkpoint": f"ckpt_ep{int(epoch):05d}.pt",
+        "topology_guards": guard_values,
     }
     candidates = [p for p in candidates if int(p["epoch"]) != int(epoch)]
     candidates.append(point)
@@ -1983,7 +2325,22 @@ def update_pareto_selection(state: Optional[dict], *, epoch: int, rf_val: float,
     best_rf = min(float(p["rf_val_loss"]) for p in candidates)
     constraint_baseline = best_rf if rf_baseline is None else float(rf_baseline)
     rf_limit = constraint_baseline + tolerance * max(abs(constraint_baseline), 1e-12)
-    feasible = [p for p in candidates if float(p["rf_val_loss"]) <= rf_limit + 1e-15]
+    def guards_pass(point):
+        values = dict(point.get("topology_guards", {}))
+        for name, baseline in guard_baselines.items():
+            allowance = max(
+                guard_absolute_tolerance,
+                guard_relative_tolerance * max(abs(baseline), 1e-12))
+            if name not in values or float(values[name]) > baseline + allowance + 1e-15:
+                return False
+        return True
+
+    feasible = [
+        p for p in candidates
+        if (float(p["rf_val_loss"]) <= rf_limit + 1e-15
+            and (topology_baseline is None
+                 or float(p["topology_val"]) < float(topology_baseline))
+            and guards_pass(p))]
     if not feasible:
         # Record the frontier but do not silently violate the RF constraint.
         selected = None
@@ -2008,6 +2365,11 @@ def update_pareto_selection(state: Optional[dict], *, epoch: int, rf_val: float,
         "topology_metric": str(topology_metric),
         "rf_relative_tolerance": tolerance,
         "configured_rf_baseline": (None if rf_baseline is None else float(rf_baseline)),
+        "configured_topology_baseline": (
+            None if topology_baseline is None else float(topology_baseline)),
+        "configured_topology_guard_baselines": guard_baselines,
+        "topology_guard_relative_tolerance": guard_relative_tolerance,
+        "topology_guard_absolute_tolerance": guard_absolute_tolerance,
         "best_rf_val_loss": best_rf,
         "rf_feasibility_limit": rf_limit,
         "candidates": candidates,
@@ -2175,11 +2537,18 @@ class DirectCoherenceHistoryLogger:
     FIELDS = [
         "epoch", "train_total_loss", "train_data_loss", "train_coherence_loss",
         "coherence_topo_loss", "coherence_soft_rcc", "coherence_mph", "coherence_ph",
+        "coherence_dice", "coherence_cldice",
         # Per-cell topology diagnostics.
-        "coherence_self_h0", "coherence_self_h1", "coherence_mutual_h0",
+        "coherence_self_h0", "coherence_self_h1",
+        "coherence_self_persistence_h0", "coherence_self_persistence_h1",
+        "coherence_mutual_h0",
         "coherence_mutual_h1", "coherence_mutual_r2", "coherence_mutual_spatial",
         "coherence_output_mutual_h0", "coherence_output_mutual_h1",
+        "coherence_output_mutual_persistence_h0",
+        "coherence_output_mutual_persistence_h1",
         "coherence_output_mutual_spatial",
+        "coherence_self_persistence_sample_fraction",
+        "coherence_persistence_sample_fraction",
         "coherence_physics_loss", "coherence_physics_w_curl",
         "coherence_physics_divergence",
         # H0 creation diagnostics.
@@ -2191,17 +2560,27 @@ class DirectCoherenceHistoryLogger:
         "coherence_output_mutual_binding_fraction",
         "coherence_output_mutual_generated_binding_fraction",
         "coherence_output_mutual_reference_binding_fraction",
-        "coherence_application_fraction", "coherence_weight_base",
+        "coherence_application_fraction", "coherence_selected_strata",
+        "coherence_selected_strata_fraction", "coherence_weight_base",
         "coherence_weight_scheduled", "coherence_weight_applied",
         "coherence_interval_scale",
-        "raw_data_grad_norm", "raw_coherence_grad_norm",
+        "raw_data_grad_norm", "raw_coherence_grad_norm", "raw_anchor_grad_norm",
         "data_grad_norm", "coherence_grad_norm", "gradient_cosine",
+        "topology_anchor_gradient_cosine", "topology_constraint_gradient_cosine",
+        "topology_gradient_scale", "topology_gradient_target_ratio",
         "applied_gradient_ratio",
         "combined_pre_clip_grad_norm", "combined_post_clip_grad_norm",
         "gradient_clip_factor", "gradient_clip_fraction", "gradient_diagnostic_samples",
         "gradient_conflict_fraction",
         # Held-out coherence.
         "val_coherence_loss", "val_topology_selection_loss",
+        "val_exact_h0_curve_l1", "val_exact_h0_curve_bias", "val_exact_h0_curve_nmae",
+        "val_exact_h1_curve_l1", "val_exact_h1_curve_bias", "val_exact_h1_curve_nmae",
+        "val_exact_mutual_h0_nmae", "val_exact_mutual_h1_nmae",
+        "val_topo_self_persistence_h0", "val_topo_self_persistence_h1",
+        "val_topo_output_mutual_persistence_h0",
+        "val_topo_output_mutual_persistence_h1",
+        "val_exact_mutual_spatial_error", "val_comprehensive_topology_score",
         "lr", "global_step",
         # Constrained (primal-dual) mode.
         "anchor_loss", "dual_mu_data", "dual_mu_anchor",
@@ -2235,16 +2614,30 @@ class DirectCoherenceHistoryLogger:
             "coherence_soft_rcc": metrics.get("coherence_soft_rcc"),
             "coherence_mph": metrics.get("coherence_mph"),
             "coherence_ph": metrics.get("coherence_ph"),
+            "coherence_dice": metrics.get("coherence_dice"),
+            "coherence_cldice": metrics.get("coherence_cldice"),
             "coherence_self_h0": metrics.get("coherence_self_h0"),
             "coherence_self_h1": metrics.get("coherence_self_h1"),
+            "coherence_self_persistence_h0": metrics.get(
+                "coherence_self_persistence_h0"),
+            "coherence_self_persistence_h1": metrics.get(
+                "coherence_self_persistence_h1"),
             "coherence_mutual_h0": metrics.get("coherence_mutual_h0"),
             "coherence_mutual_h1": metrics.get("coherence_mutual_h1"),
             "coherence_mutual_r2": metrics.get("coherence_mutual_r2"),
             "coherence_mutual_spatial": metrics.get("coherence_mutual_spatial"),
             "coherence_output_mutual_h0": metrics.get("coherence_output_mutual_h0"),
             "coherence_output_mutual_h1": metrics.get("coherence_output_mutual_h1"),
+            "coherence_output_mutual_persistence_h0": metrics.get(
+                "coherence_output_mutual_persistence_h0"),
+            "coherence_output_mutual_persistence_h1": metrics.get(
+                "coherence_output_mutual_persistence_h1"),
             "coherence_output_mutual_spatial": metrics.get(
                 "coherence_output_mutual_spatial"),
+            "coherence_self_persistence_sample_fraction": metrics.get(
+                "coherence_self_persistence_sample_fraction"),
+            "coherence_persistence_sample_fraction": metrics.get(
+                "coherence_persistence_sample_fraction"),
             "coherence_physics_loss": metrics.get("coherence_physics_loss"),
             "coherence_physics_w_curl": metrics.get("coherence_physics_w_curl"),
             "coherence_physics_divergence": metrics.get(
@@ -2268,15 +2661,26 @@ class DirectCoherenceHistoryLogger:
             "coherence_output_mutual_reference_binding_fraction": metrics.get(
                 "coherence_output_mutual_reference_binding_fraction"),
             "coherence_application_fraction": metrics.get("coherence_application_fraction"),
+            "coherence_selected_strata": metrics.get("coherence_selected_strata"),
+            "coherence_selected_strata_fraction": metrics.get(
+                "coherence_selected_strata_fraction"),
             "coherence_weight_base": metrics.get("coherence_weight_base"),
             "coherence_weight_scheduled": metrics.get("coherence_weight_scheduled"),
             "coherence_weight_applied": metrics.get("coherence_weight_applied"),
             "coherence_interval_scale": metrics.get("coherence_interval_scale"),
             "raw_data_grad_norm": metrics.get("raw_data_grad_norm"),
             "raw_coherence_grad_norm": metrics.get("raw_coherence_grad_norm"),
+            "raw_anchor_grad_norm": metrics.get("raw_anchor_grad_norm"),
             "data_grad_norm": metrics.get("data_grad_norm"),
             "coherence_grad_norm": metrics.get("coherence_grad_norm"),
             "gradient_cosine": metrics.get("gradient_cosine"),
+            "topology_anchor_gradient_cosine": metrics.get(
+                "topology_anchor_gradient_cosine"),
+            "topology_constraint_gradient_cosine": metrics.get(
+                "topology_constraint_gradient_cosine"),
+            "topology_gradient_scale": metrics.get("topology_gradient_scale"),
+            "topology_gradient_target_ratio": metrics.get(
+                "topology_gradient_target_ratio"),
             "applied_gradient_ratio": metrics.get("applied_gradient_ratio"),
             "combined_pre_clip_grad_norm": metrics.get("combined_pre_clip_grad_norm"),
             "combined_post_clip_grad_norm": metrics.get("combined_post_clip_grad_norm"),
@@ -2289,6 +2693,48 @@ class DirectCoherenceHistoryLogger:
             "val_topology_selection_loss": (
                 None if not val_coherence else val_coherence.get(
                     "val_topo_topo_selection_loss")),
+            "val_exact_h0_curve_l1": (
+                None if not val_coherence else val_coherence.get(
+                    "val_exact_h0_curve_l1")),
+            "val_exact_h0_curve_bias": (
+                None if not val_coherence else val_coherence.get(
+                    "val_exact_h0_curve_bias")),
+            "val_exact_h0_curve_nmae": (
+                None if not val_coherence else val_coherence.get(
+                    "val_exact_h0_curve_nmae")),
+            "val_exact_h1_curve_l1": (
+                None if not val_coherence else val_coherence.get(
+                    "val_exact_h1_curve_l1")),
+            "val_exact_h1_curve_bias": (
+                None if not val_coherence else val_coherence.get(
+                    "val_exact_h1_curve_bias")),
+            "val_exact_h1_curve_nmae": (
+                None if not val_coherence else val_coherence.get(
+                    "val_exact_h1_curve_nmae")),
+            "val_exact_mutual_h0_nmae": (
+                None if not val_coherence else val_coherence.get(
+                    "val_exact_mutual_h0_nmae")),
+            "val_exact_mutual_h1_nmae": (
+                None if not val_coherence else val_coherence.get(
+                    "val_exact_mutual_h1_nmae")),
+            "val_topo_self_persistence_h0": (
+                None if not val_coherence else val_coherence.get(
+                    "val_topo_self_persistence_h0")),
+            "val_topo_self_persistence_h1": (
+                None if not val_coherence else val_coherence.get(
+                    "val_topo_self_persistence_h1")),
+            "val_topo_output_mutual_persistence_h0": (
+                None if not val_coherence else val_coherence.get(
+                    "val_topo_output_mutual_persistence_h0")),
+            "val_topo_output_mutual_persistence_h1": (
+                None if not val_coherence else val_coherence.get(
+                    "val_topo_output_mutual_persistence_h1")),
+            "val_exact_mutual_spatial_error": (
+                None if not val_coherence else val_coherence.get(
+                    "val_exact_mutual_spatial_error")),
+            "val_comprehensive_topology_score": (
+                None if not val_coherence else val_coherence.get(
+                    "val_comprehensive_topology_score")),
             "lr": lr,
             "global_step": global_step,
             "anchor_loss": metrics.get("anchor_loss"),
@@ -2333,7 +2779,19 @@ def run_epoch_direct_coherence(model, loader, optimizer, device, args, direct_cf
                                topo_loss_fn, topo_idx_t, global_step, epoch,
                                mean=None, std=None, ema=None, base_model=None):
     """Run one RF-plus-coherence epoch and return metrics and global step."""
-    model.train(True)
+    # Post-training runs with the model in EVAL mode (gradients still flow;
+    # only dropout/param-jitter are disabled). N20 root cause (2026-08-19):
+    # the topology rollouts already forward through _eval_mode_velocity, and
+    # deterministic validation / Pareto selection / deployment all measure the
+    # eval-mode function -- but the data and anchor losses were computed with
+    # dropout active, so the constraints watched a DIFFERENT function from the
+    # one the objective was moving. The optimizer wrecked the eval-mode model
+    # (val RF 0.52 -> 17) while every dropout-mode budget read as satisfied.
+    # Running the whole epoch in eval mode makes objective, constraints, the
+    # data-only control arm, and validation all see the same function. Dropout
+    # regularisation is not needed here: every direct_coherence run warm-starts
+    # from a converged base and is bounded by the data/anchor budgets.
+    model.train(False)
     _dc_grid_ny, _dc_grid_nx = resolve_stride_grid(
         getattr(args, "obs_grid_stride_list", None),
         getattr(loader, "dataset", None))
@@ -2342,8 +2800,14 @@ def run_epoch_direct_coherence(model, loader, optimizer, device, args, direct_cf
         if bool(getattr(args, "obs_grid_pool", False)) else None
     rows = []
     every = max(1, int(args.coherence_every_n_steps))
-    topology_enabled = bool(direct_cfg.enabled)
-    constrained = topology_enabled and constrained_mode_active(args)
+    # The constrained problem exists only to bound a topology objective, so it is
+    # inert when coherence is disabled: a data-only control arm keeps its twin's
+    # topo_objective_mode purely so the two configs stay diffable, and must still
+    # run plain data steps. Without this gate such an arm dies here, or reaches
+    # data_and_anchor_losses() with base_model=None -- the caller builds the frozen
+    # anchor only when direct_cfg.enabled is true.
+    coherence_enabled = bool(getattr(direct_cfg, "enabled", False))
+    constrained = constrained_mode_active(args) and coherence_enabled
     if constrained and base_model is None:
         raise RuntimeError(
             "topo_objective_mode='constrained' requires the frozen base model "
@@ -2357,47 +2821,45 @@ def run_epoch_direct_coherence(model, loader, optimizer, device, args, direct_cf
 
     pbar = tqdm(loader, desc=f"epoch {epoch} [direct_coherence]", leave=False)
     for batch in pbar:
-        coords_full = batch["coords"].to(device)       # [B, N, 3]
-        fields_full = batch["fields"].to(device)       # [B, N, C]
-        valid_mask = batch.get("valid_sensor_mask")
-        if valid_mask is not None:
-            valid_mask = valid_mask.to(device)
-
-        obs_coords, obs_values, obs_mask, obs_indices, obs_field_ids = build_sparse_condition(
-            coords_full=coords_full, fields_full=fields_full,
-            cond_fields=args.cond_fields, n_obs_min=args.n_obs_min_list,
-            n_obs_max=args.n_obs_max_list, valid_mask=valid_mask,
+        rb = prepare_rf_batch(
+            batch, model, device,
+            cond_fields=args.cond_fields,
+            n_obs_min_list=args.n_obs_min_list,
+            n_obs_max_list=args.n_obs_max_list,
+            n_query_points=args.n_query_points,
             sensor_layout=str(getattr(args, "sensor_layout", "independent")),
-            Ny=_dc_grid_ny, Nx=_dc_grid_nx,
+            grid_ny=_dc_grid_ny,
+            grid_nx=_dc_grid_nx,
             obs_grid_strides=getattr(args, "obs_grid_stride_list", None),
             obs_grid_pool=bool(getattr(args, "obs_grid_pool", False)),
-            pool_value_transform=_dc_pool_value_transform)
+            pool_value_transform=_dc_pool_value_transform,
+        )
+        # The topology block below indexes the full batch by stratum selection.
+        coords_full, fields_full = rb.coords_full, rb.fields_full
+        obs_coords, obs_values, obs_mask = rb.obs_coords, rb.obs_values, rb.obs_mask
+        obs_indices, obs_field_ids, params = rb.obs_indices, rb.obs_field_ids, rb.params
 
-        # RF data loss.
-        eff_nq = None if getattr(model, "requires_full_grid", False) else args.n_query_points
-        coords_q, fields_q, _ = random_query_subset(coords_full, fields_full, eff_nq)
-        params = batch_params(batch, model, device)
+        # RF data loss (and, in constrained mode, the function-space anchor):
+        # both are model.rf_terms under the hood — identical to the data-only
+        # control and to deterministic validation by construction.
         anchor_loss = None
         if constrained:
             data_loss, anchor_loss = data_and_anchor_losses(
-                model, base_model, x1=fields_q, coords=coords_q,
-                obs_coords=obs_coords, obs_values=obs_values, obs_mask=obs_mask,
-                obs_field_ids=obs_field_ids,
-                params=params)
+                model, base_model, **rb.loss_kwargs())
         else:
             data_loss, _ = model.training_loss(
-                x1=fields_q, coords=coords_q, obs_coords=obs_coords, obs_values=obs_values,
-                obs_mask=obs_mask, obs_field_ids=obs_field_ids, obs_indices=obs_indices,
-                **({} if params is None else {"params": params}))
+                obs_indices=rb.obs_indices, **rb.loss_kwargs())
 
         global_step += 1
         coherence_active = (
-            topology_enabled
+            bool(direct_cfg.enabled)
             and topo_loss_fn is not None
             and int(epoch) >= int(args.coherence_start_epoch)
             and (global_step % every == 0)
-            and (not topo_guard_state(args)["coherence_disabled"] if constrained
-                 else coherence_weight > 0.0)
+            # The constrained path carries no separate weight: the topology term is
+            # the objective and the duals scale the constraints. The legacy
+            # weighted_sum path still gates on its fixed weight.
+            and (True if constrained else coherence_weight > 0.0)
         )
 
         row = {"data_loss": float(data_loss.detach().cpu()), "coherence_applied": 0}
@@ -2448,6 +2910,15 @@ def run_epoch_direct_coherence(model, loader, optimizer, device, args, direct_cf
                     len({str(regimes_full[int(i)]) for i in sel.tolist()}))
                 row["coherence_selected_strata_fraction"] = (
                     row["coherence_selected_strata"] / max(cbsz, 1))
+                minimum_strata = int(getattr(args, "topo_min_train_strata", 0))
+                if (minimum_strata > 0
+                        and row["coherence_selected_strata"] < minimum_strata):
+                    raise RuntimeError(
+                        f"active topology batch covers only "
+                        f"{int(row['coherence_selected_strata'])} strata; "
+                        f"topo_min_train_strata={minimum_strata}. Enable "
+                        "topo_stratified_train_batches and set coherence_batch_size "
+                        "at least as large as the stratum count.")
             else:
                 sel = torch.randperm(bsz, device=device)[:cbsz]
             coords_topo = coords_full[sel][:, topo_idx_t, :]
@@ -2461,18 +2932,28 @@ def run_epoch_direct_coherence(model, loader, optimizer, device, args, direct_cf
                 full_rollout = bool(getattr(args, "topo_rollout_full_grid", False))
                 rollout_fields = fields_full[sel] if full_rollout else fields_topo
                 rollout_coords = coords_full[sel] if full_rollout else coords_topo
-                x_hat_rollout = clean_estimate_rollout(
-                    model, rollout_fields, rollout_coords,
-                    obs_coords[sel], obs_values[sel], obs_mask[sel], obs_field_ids[sel],
+                rollout_gradient_mode = str(getattr(
+                    args, "topo_rollout_gradient_mode", "last_k"))
+                rollout_kwargs = dict(
                     obs_indices=obs_idx_sel,
                     n_steps=int(args.epi_rollout_steps),
                     source_seed=int(global_step),
                     ode_solver=str(getattr(args, "ode_solver", "euler")),
                     obs_consistency_mode=str(getattr(
                         args, "topo_obs_consistency_mode", "none")),
-                    params=params_sel,
-                    backprop_last_k=(
-                        int(getattr(args, "topo_rollout_backprop_k", 0)) or None))
+                    params=params_sel)
+                if rollout_gradient_mode == "random_step":
+                    x_hat_rollout = clean_estimate_random_rollout_step(
+                        model, rollout_fields, rollout_coords,
+                        obs_coords[sel], obs_values[sel], obs_mask[sel],
+                        obs_field_ids[sel], **rollout_kwargs)
+                else:
+                    x_hat_rollout = clean_estimate_rollout(
+                        model, rollout_fields, rollout_coords,
+                        obs_coords[sel], obs_values[sel], obs_mask[sel],
+                        obs_field_ids[sel], **rollout_kwargs,
+                        backprop_last_k=(int(getattr(
+                            args, "topo_rollout_backprop_k", 0)) or None))
                 x_hat1 = x_hat_rollout[:, topo_idx_t, :] if full_rollout else x_hat_rollout
             else:
                 x_hat1 = clean_estimate(
@@ -2513,27 +2994,44 @@ def run_epoch_direct_coherence(model, loader, optimizer, device, args, direct_cf
                     print(f"[dual] step={global_step} topo_norm frozen at "
                           f"{duals['topo_norm']:.4g} (constant objective rescale)",
                           flush=True)
-                topo_objective = (float(every) / duals["topo_norm"]) * coherence_loss_raw
-                lagrangian = (topo_objective
-                              + duals["mu_data"] * data_loss
-                              + duals["mu_anchor"] * anchor_loss)
-                optimizer.zero_grad(set_to_none=True)
-                lagrangian.backward()
-                if clip_norm > 0.0:
-                    pre_clip = float(nn.utils.clip_grad_norm_(
-                        model.parameters(), max_norm=clip_norm))
+                normalize_topology = bool(getattr(
+                    args, "topo_normalize_constrained_gradient", False))
+                if normalize_topology:
+                    target_ratio = _topology_gradient_ratio(args, epoch)
+                    grad_info = _normalized_constrained_update(
+                        model=model, optimizer=optimizer,
+                        data_loss=data_loss, anchor_loss=anchor_loss,
+                        topology_loss=coherence_loss_raw,
+                        mu_data=duals["mu_data"], mu_anchor=duals["mu_anchor"],
+                        target_ratio=target_ratio,
+                        grad_clip_norm=(clip_norm if clip_norm > 0.0 else None))
+                    pre_clip = float(grad_info["combined_grad_norm"])
                 else:
-                    pre_clip = _grad_norm(model)
+                    topo_objective = (
+                        float(every) / duals["topo_norm"]) * coherence_loss_raw
+                    lagrangian = (topo_objective
+                                  + duals["mu_data"] * data_loss
+                                  + duals["mu_anchor"] * anchor_loss)
+                    optimizer.zero_grad(set_to_none=True)
+                    lagrangian.backward()
+                    if clip_norm > 0.0:
+                        pre_clip = float(nn.utils.clip_grad_norm_(
+                            model.parameters(), max_norm=clip_norm))
+                    else:
+                        pre_clip = _grad_norm(model)
+                    grad_info = {"combined_grad_norm": pre_clip}
                 row.update(_clip_metrics(pre_clip, clip_norm))
-                optimizer.step()
+                if not normalize_topology:
+                    optimizer.step()
                 update_topo_duals(args, row["data_loss"], row["anchor_loss"])
                 row["dual_mu_data"] = duals["mu_data"]
                 row["dual_mu_anchor"] = duals["mu_anchor"]
                 row["topo_objective_normalized"] = float(
                     (coherence_loss_raw / duals["topo_norm"]).detach())
-                grad_info = {"combined_grad_norm": pre_clip}
             else:
-                # Fixed-weight and ConFIG modes use a fused two-objective update.
+                # Legacy fixed-weight path (weighted_sum with a config lambda,
+                # or ConFIG): fused two-objective update, with separate
+                # diagnostic gradients on measured steps only.
                 measure = (
                     args.gradient_balance_mode == "weighted_sum"
                     and diagnostics_every > 0
@@ -2598,18 +3096,34 @@ def run_epoch_direct_coherence(model, loader, optimizer, device, args, direct_cf
                 row["data_grad_norm"] = abs(data_weight) * float(raw_data_norm)
             if raw_topo_norm is not None and math.isfinite(float(raw_topo_norm)):
                 row["raw_coherence_grad_norm"] = float(raw_topo_norm)
+                applied_topology_norm = grad_info.get("applied_topology_grad_norm")
                 row["coherence_grad_norm"] = (
-                    float(raw_topo_norm) * float(row.get(
+                    float(applied_topology_norm) if applied_topology_norm is not None
+                    else float(raw_topo_norm) * float(row.get(
                         "coherence_weight_applied", coherence_weight * interval_scale)))
+            raw_anchor_norm = grad_info.get("raw_anchor_grad_norm")
+            if raw_anchor_norm is not None and math.isfinite(float(raw_anchor_norm)):
+                row["raw_anchor_grad_norm"] = float(raw_anchor_norm)
             cosine = grad_info.get("gradient_cosine")
             if cosine is not None and math.isfinite(float(cosine)):
                 row["gradient_cosine"] = float(cosine)
+            for diagnostic in (
+                    "topology_anchor_gradient_cosine",
+                    "topology_constraint_gradient_cosine",
+                    "topology_gradient_scale",
+                    "topology_gradient_target_ratio"):
+                value = grad_info.get(diagnostic)
+                if value is not None and math.isfinite(float(value)):
+                    row[diagnostic] = float(value)
             if row.get("data_grad_norm", 0.0) > 0.0 \
                     and "coherence_grad_norm" in row:
                 row["applied_gradient_ratio"] = (
                     row["coherence_grad_norm"] / row["data_grad_norm"])
             # Weighted-sum updates do not measure per-objective conflict.
             _gc = grad_info.get("gradient_conflict", None)
+            if (_gc is None
+                    and grad_info.get("topology_constraint_gradient_cosine") is not None):
+                _gc = float(grad_info["topology_constraint_gradient_cosine"]) < 0.0
             row["gradient_conflict"] = None if _gc is None else (1 if _gc else 0)
             row["coherence_applied"] = 1 if topo_applied else 0
             restore_rng_state(coherence_rng)
@@ -2644,6 +3158,14 @@ def run_epoch_direct_coherence(model, loader, optimizer, device, args, direct_cf
         "applied_gradient_ratio": _mean_metric(rows, "applied_gradient_ratio"),
         "raw_data_grad_norm": _mean_metric(rows, "raw_data_grad_norm"),
         "raw_coherence_grad_norm": _mean_metric(rows, "raw_coherence_grad_norm"),
+        "raw_anchor_grad_norm": _mean_metric(rows, "raw_anchor_grad_norm"),
+        "topology_anchor_gradient_cosine": _mean_metric(
+            rows, "topology_anchor_gradient_cosine"),
+        "topology_constraint_gradient_cosine": _mean_metric(
+            rows, "topology_constraint_gradient_cosine"),
+        "topology_gradient_scale": _mean_metric(rows, "topology_gradient_scale"),
+        "topology_gradient_target_ratio": _mean_metric(
+            rows, "topology_gradient_target_ratio"),
         "combined_pre_clip_grad_norm": _mean_metric(
             rows, "combined_pre_clip_grad_norm"),
         "combined_post_clip_grad_norm": _mean_metric(
@@ -2683,19 +3205,33 @@ def main():
         raise SystemExit(0)
     script_dir = os.path.dirname(os.path.realpath(__file__))
     demo_dir = os.path.dirname(script_dir)
-
+    
     # Load the YAML now; archive it only after resume discovery confirms there
     # is work to do (completed resubmissions should be write-free).
     config_path = os.path.join(demo_dir, args.config)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     config_backup_path = None
-
+    
     # Track explicitly configured keys.
     yaml_config = {}
     if os.path.exists(config_path):
         print(f"\n[*] Starting:... I found config file at: {config_path}\n")
         with open(config_path, "r") as f:
             yaml_config = yaml.safe_load(f) or {}
+
+        # Small experiment overlays avoid copying hundreds of architecture and
+        # dataset keys. Paths are resolved beside the active YAML; one level is
+        # deliberately sufficient so experiment provenance stays easy to audit.
+        extends = yaml_config.pop("extends", None)
+        if extends is not None:
+            base_config_path = Path(config_path).parent / str(extends)
+            with open(base_config_path, "r") as f:
+                base_yaml = yaml.safe_load(f) or {}
+            if "extends" in base_yaml:
+                raise ValueError("nested YAML 'extends' is not supported")
+            base_yaml.update(yaml_config)
+            yaml_config = base_yaml
+            print(f"[*] Applied config overlay on: {base_config_path}")
 
         # Migrate renamed topology keys.
         yaml_config = migrate_yaml_keys(yaml_config)
@@ -2737,6 +3273,8 @@ def main():
     best_val = float("inf")
     pareto_state = None
     pareto_rf_source_baseline = getattr(args, "pareto_rf_baseline", None)
+    pareto_topology_source_baseline = None
+    pareto_topology_guard_baselines = None
     source_epoch = None
     reload_ckpt = None
     resume_ckpt_path = None
@@ -2758,6 +3296,18 @@ def main():
             run_timestamp = extract_run_timestamp(latest_run_dir, args.save_dir, args.Demo_Num)
             reload_ckpt = load_trusted_checkpoint(resume_ckpt_path)
             pareto_state = reload_ckpt.get("pareto_selection_state")
+            pareto_topology_source_baseline = reload_ckpt.get(
+                "pareto_topology_source_baseline")
+            pareto_topology_guard_baselines = reload_ckpt.get(
+                "pareto_topology_guard_baselines")
+            if (pareto_topology_source_baseline is None
+                    and pareto_state is not None):
+                pareto_topology_source_baseline = pareto_state.get(
+                    "configured_topology_baseline")
+            if (pareto_topology_guard_baselines is None
+                    and pareto_state is not None):
+                pareto_topology_guard_baselines = pareto_state.get(
+                    "configured_topology_guard_baselines")
             stored_pareto_baseline = reload_ckpt.get("pareto_rf_source_baseline")
             if stored_pareto_baseline is None and pareto_state is not None:
                 stored_pareto_baseline = pareto_state.get("configured_rf_baseline")
@@ -3195,11 +3745,11 @@ def main():
         model = FNOFFM(backbone, prior, sigma_min=args.sigma_min).to(device)
 
         print(f"[*] Using grid-based FNO baseline with Num_x={args.Num_x}, Num_y={args.Num_y}")
-        print("[*] n_query_points is ignored for FNO because it requires the full grid.\n")
+        print("[*] Note: n_query_points is ignored for FNO because it requires the full grid.\n")
     else:
         raise ValueError(
-            f"unsupported backbone {args.backbone!r}; expected one of "
-            "['mlp_rbf', 'perceiver', 'fno']"
+            f'Error!!! Your backbone is not supported: {args.backbone}.'
+            'Please select in ["mlp_rbf", "perceiver", "fno"]'
             )
     print(f'\nSelected Backbone: {args.backbone}\n')
 
@@ -3239,13 +3789,6 @@ def main():
             args.coherence_loss_weight = float(reload_ckpt["coherence_loss_weight"])
             print(f"[*] Restored coherence_loss_weight="
                   f"{float(args.coherence_loss_weight):.4g}")
-        if isinstance(reload_ckpt.get("topo_guard_state"), dict):
-            restored_guard = topo_guard_state(args)
-            restored_guard.update(reload_ckpt["topo_guard_state"])
-            print(f"[*] Restored topo guard state: "
-                  f"disabled={bool(restored_guard['coherence_disabled'])}")
-            if bool(restored_guard["coherence_disabled"]):
-                args.coherence_loss_weight = 0.0
         if isinstance(reload_ckpt.get("topo_dual_state"), dict):
             restored_duals = topo_dual_state(args)
             restored_duals.update(reload_ckpt["topo_dual_state"])
@@ -3565,9 +4108,13 @@ def main():
         else:
             print("[*] training_mode=direct_coherence but direct_coherence_enabled=false; "
                   "running data-only post-training.")
+        print("[*] direct_coherence: ALL training forwards run in eval mode "
+              "(dropout/param-jitter off) so the objective, the data/anchor "
+              "constraints, the control arm, and validation see the same "
+              "function (N20 mode-mismatch fix, 2026-08-19).")
         coh_logger = DirectCoherenceHistoryLogger(save_dir)
 
-    # Restore the shared RNG stream after loss and reference setup.
+    # Loss/reference setup must not desynchronize treatment and control streams.
     restore_rng_state(
         resume_rng_state if resume_rng_state is not None else topology_setup_rng_state)
     if resume_rng_state is not None:
@@ -3588,6 +4135,59 @@ def main():
                 abs(float(pareto_rf_source_baseline)), 1e-12)
         print(f"[*] Pareto RF source baseline={float(pareto_rf_source_baseline):.6e}; "
               f"limit={_rf_limit:.6e}")
+        require_topology_improvement = bool(getattr(
+            args, "pareto_require_topology_improvement", False))
+        guard_names = [str(name) for name in getattr(
+            args, "pareto_topology_guard_metrics", [])]
+        if len(set(guard_names)) != len(guard_names):
+            raise ValueError("pareto_topology_guard_metrics contains duplicates")
+        missing_primary = (
+            require_topology_improvement and pareto_topology_source_baseline is None)
+        missing_guards = bool(guard_names) and pareto_topology_guard_baselines is None
+        source_topology = None
+        if missing_primary or missing_guards:
+            if reload_ckpt is not None:
+                raise RuntimeError(
+                    "The resumed Pareto run lacks frozen-source topology baselines. "
+                    "Start a new treatment run so all primary and guard metrics are measured "
+                    "before updates.")
+            if topo_loss_fn is None:
+                raise RuntimeError(
+                    "Topology-improvement gating requires an active topology loss")
+            from coherence_eval import val_coherence as _source_val_coherence
+            source_topology = _source_val_coherence(
+                model, val_loader, topo_loss_fn, topo_idx_t, device, args,
+                mean=train_set.mean, std=train_set.std,
+                max_batches=int(getattr(args, "val_coherence_batches", 4)))
+        if missing_primary:
+            metric_name = str(getattr(
+                args, "pareto_topology_metric", "val_topo_topo_selection_loss"))
+            pareto_topology_source_baseline = source_topology.get(metric_name)
+            if (pareto_topology_source_baseline is None
+                    or not math.isfinite(float(pareto_topology_source_baseline))):
+                raise RuntimeError(
+                    f"Frozen-source topology metric {metric_name!r} is missing or "
+                    f"non-finite; available metrics: {sorted(source_topology)}")
+        if missing_guards:
+            pareto_topology_guard_baselines = {}
+            for name in guard_names:
+                value = source_topology.get(name)
+                if value is None or not math.isfinite(float(value)):
+                    raise RuntimeError(
+                        f"Frozen-source topology guard {name!r} is missing or non-finite; "
+                        f"available metrics: {sorted(source_topology)}")
+                pareto_topology_guard_baselines[name] = float(value)
+        if require_topology_improvement:
+            print(f"[*] Pareto topology source baseline "
+                  f"{args.pareto_topology_metric}="
+                  f"{float(pareto_topology_source_baseline):.6e}; candidates must "
+                  "strictly improve it.")
+        if guard_names:
+            if set(pareto_topology_guard_baselines or {}) != set(guard_names):
+                raise RuntimeError(
+                    "Stored topology guard baselines do not match configured guard metrics")
+            print(f"[*] Pareto topology non-regression guards: "
+                  f"{pareto_topology_guard_baselines}")
 
     base_model = None
     if is_direct and direct_cfg is not None and bool(direct_cfg.enabled) \
@@ -3602,7 +4202,9 @@ def main():
         args._data_budget = _baseline * (1.0 + _tol)
         args._anchor_budget = float(
             getattr(args, "anchor_budget_frac", 0.05)) * _baseline
-        # Load the frozen source checkpoint as the anchor reference.
+        # Frozen copy of the pretrained source as the anchor reference. On
+        # resume, source_checkpoint comes from checkpoint provenance, so the
+        # anchor is always the original base, never the resumed iterate.
         base_model = copy.deepcopy(model)
         _base_ckpt = load_trusted_checkpoint(source_checkpoint)
         _base_state = (_base_ckpt["model"]
@@ -3710,9 +4312,6 @@ def main():
                 if ema is not None:
                     ema.restore(model)
             print(f"[valid] epoch={epoch:04d} loss={val_loss:.6e}")
-            if (is_direct and direct_cfg is not None and bool(direct_cfg.enabled)):
-                update_val_rf_guard(args, epoch, float(val_loss),
-                                    pareto_rf_source_baseline)
             improved = val_loss < best_val
             best_val = min(best_val, val_loss)
 
@@ -3730,6 +4329,9 @@ def main():
                 "method": "1_rectified_flow",
                 "backbone": args.backbone,
                 "summary_type": args.summary_type,
+                # Non-persistent gather geometry is also recorded explicitly so
+                # checkpoint provenance remains self-describing even if a .pt
+                # is copied without its backed-up YAML/args.json.
                 "fieldwise_rbf_gather": bool(args.fieldwise_rbf_gather),
                 "rbf_sigma": float(args.rbf_sigma),
                 "rbf_sigma_per_field": (
@@ -3769,18 +4371,24 @@ def main():
             if pareto_rf_source_baseline is not None:
                 ckpt["pareto_rf_source_baseline"] = float(
                     pareto_rf_source_baseline)
+            if pareto_topology_source_baseline is not None:
+                ckpt["pareto_topology_source_baseline"] = float(
+                    pareto_topology_source_baseline)
+            if pareto_topology_guard_baselines is not None:
+                ckpt["pareto_topology_guard_baselines"] = {
+                    str(k): float(v)
+                    for k, v in pareto_topology_guard_baselines.items()}
             # Nonlinear normalization provenance.
             if hasattr(train_set, "asinh_scale"):
                 ckpt["asinh_scale"] = train_set.asinh_scale
             if getattr(args, "ae_flow_transform", None) is not None:
                 ckpt["ae_flow_transform"] = str(args.ae_flow_transform)
             if is_direct:
-                ckpt["topo_guard_state"] = dict(topo_guard_state(args))
                 ckpt["topo_dual_state"] = dict(topo_dual_state(args))
                 _coh_state = _coherence_state_dict(topo_loss_fn)
                 if _coh_state:
                     ckpt["topo_coherence_state"] = _coh_state
-                # Compatibility field for resume tooling.
+                # Legacy mirror for old resume tools.
                 _inner_loss = getattr(topo_loss_fn, "_loss", None)
                 _ema_state = getattr(_inner_loss, "_marg_ema", None) if _inner_loss is not None else None
                 if _ema_state:
@@ -3812,7 +4420,16 @@ def main():
                     topology_val=float(metric_value),
                     rf_tolerance=float(getattr(args, "pareto_rf_relative_tolerance", 0.02)),
                     topology_metric=metric_name,
-                    rf_baseline=pareto_rf_source_baseline)
+                    rf_baseline=pareto_rf_source_baseline,
+                    topology_baseline=pareto_topology_source_baseline,
+                    topology_guard_values={
+                        name: val_coh.get(name)
+                        for name in getattr(args, "pareto_topology_guard_metrics", [])},
+                    topology_guard_baselines=pareto_topology_guard_baselines,
+                    topology_guard_relative_tolerance=float(getattr(
+                        args, "pareto_topology_guard_relative_tolerance", 0.0)),
+                    topology_guard_absolute_tolerance=float(getattr(
+                        args, "pareto_topology_guard_absolute_tolerance", 0.0)))
             if pareto_state is not None:
                 ckpt["pareto_selection_state"] = pareto_state
 
@@ -3830,30 +4447,39 @@ def main():
                         and bool(direct_cfg.enabled):
                     if pareto_state["selected"] is None:
                         write_pareto_selection(save_dir, pareto_state)
-                        raise RuntimeError(
-                            "No Pareto candidate satisfies the configured RF validation budget.")
-                    selected_epoch = int(pareto_state["selected"]["epoch"])
-                    selected_path = save_dir / f"ckpt_ep{selected_epoch:05d}.pt"
-                    if not selected_path.exists():
-                        raise RuntimeError(
-                            f"Selected Pareto snapshot is missing: {selected_path}")
-                    # Copy the immutable evaluated checkpoint, never the raw iterate.
-                    shutil.copy2(selected_path, save_dir / "pareto_best.pt")
-                    write_pareto_selection(save_dir, pareto_state)
-                    print(f"[*] Pareto selected epoch {selected_epoch}: "
-                          f"RF<={pareto_state['rf_feasibility_limit']:.4e}, "
-                          f"{pareto_state['topology_metric']}="
-                          f"{pareto_state['selected']['topology_val']:.4e}")
+                        print("[*] No RF-feasible Pareto candidate yet; retaining the "
+                              "snapshot and continuing training.")
+                        go_no_go = int(getattr(args, "topology_go_no_go_epoch", 0) or 0)
+                        if go_no_go > 0 and epoch >= go_no_go:
+                            raise RuntimeError(
+                                f"Topology go/no-go failed at epoch {epoch}: no candidate "
+                                "both improves the frozen-source topology metric and "
+                                "satisfies the RF budget. Switch mechanism rather than "
+                                "spending the remaining training budget.")
+                    else:
+                        selected_epoch = int(pareto_state["selected"]["epoch"])
+                        selected_path = save_dir / f"ckpt_ep{selected_epoch:05d}.pt"
+                        if not selected_path.exists():
+                            raise RuntimeError(
+                                f"Selected Pareto snapshot is missing: {selected_path}")
+                        # Copy the immutable evaluated checkpoint, never the raw iterate.
+                        shutil.copy2(selected_path, save_dir / "pareto_best.pt")
+                        write_pareto_selection(save_dir, pareto_state)
+                        print(f"[*] Pareto selected epoch {selected_epoch}: "
+                              f"RF<={pareto_state['rf_feasibility_limit']:.4e}, "
+                              f"{pareto_state['topology_metric']}="
+                              f"{pareto_state['selected']['topology_val']:.4e}")
                 _keep = int(getattr(args, "snapshot_keep", 0) or 0)
                 if _keep > 0:
                     _snaps = sorted(save_dir.glob("ckpt_ep*.pt"))
                     for _old in _snaps[:-_keep]:
-                        if selection_enabled and pareto_state is not None \
-                                and _old.name == pareto_state["selected"]["checkpoint"]:
+                        if (selection_enabled and pareto_state is not None
+                                and pareto_state.get("selected") is not None
+                                and _old.name == pareto_state["selected"]["checkpoint"]):
                             continue
                         _old.unlink()
                         print(f"[*] Snapshot pruned: {_old.name}")
-
+        
         if epoch % args.save_every == 0:
             benchmark_rng = collect_rng_state()
             recon_dir_epoch = os.path.join(recon_dir, f"Epoch_{epoch}")

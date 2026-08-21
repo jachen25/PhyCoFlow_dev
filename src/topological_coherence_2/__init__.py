@@ -1,12 +1,42 @@
-"""RCC8-based topological coherence for multi-field reconstruction.
+"""
+topological_coherence_2
+=======================
 
-Public attributes resolve lazily to avoid loading visualization dependencies
-for direct submodule imports.
+A rigorous, RCC8-based topological coherence module for multi-field physical
+reconstruction.  It measures whether a generated multi-field state preserves the
+*persistent mutual-relatedness* among physically meaningful regions across
+fields -- i.e. whether the qualitative spatial relationships (disconnected,
+overlapping, contained, ...) between salient regions of, say, temperature and a
+species concentration are reproduced by a reconstruction.
+
+Pipeline
+--------
+    u : [C, H, W]
+      -> saliency      s_c(x)                      (saliency.py)
+      -> thresholds    R_c(alpha)                  (profiles.py)
+      -> components    C_c(alpha)                  (profiles.py)
+      -> RCC8 relations rho(A, B)                  (rcc.py)
+      -> profile       mu_ij(alpha_i, alpha_j, r)  (profiles.py)
+      -> loss          L_MR_RCC(pred, ref)         (losses.py)
+      -> plots                                     (visualization.py)
+
+A differentiable training surrogate lives in :mod:`soft_torch`.
+
+Quickstart
+----------
+    >>> from topological_coherence_2 import TopologicalCoherence
+    >>> tc = TopologicalCoherence(field_names=["CO", "T"], saliency="zscore_abs")
+    >>> res = tc.loss(u_pred, u_ref)        # u_*: [C, H, W]
+    >>> res["total_loss"]
+
+Package attributes resolve lazily (PEP 562) so that direct submodule imports
+(e.g. ``from topological_coherence_2.diff_persistence import ...``) do not drag
+in matplotlib/scipy via the eager re-exports.
 """
 
 from __future__ import annotations
 
-# Public attribute-to-module map.
+# name -> submodule that defines it
 _LAZY_ATTRS = {
     "TopologicalCoherence": "core",
     "d_js": "losses",
@@ -62,7 +92,7 @@ def __getattr__(name):
     import importlib
     mod = importlib.import_module(f".{mod_name}", __name__)
     value = getattr(mod, name)
-    globals()[name] = value          # Cache subsequent attribute access.
+    globals()[name] = value          # cache: subsequent access skips __getattr__
     return value
 
 

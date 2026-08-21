@@ -1,0 +1,281 @@
+# N20 topology arm on the N19 fieldwise-gather joint-SR base.
+# Epoch-matched control: N21 (config_pointcloud_ffm_dataonly_posttrain_N19.yaml).
+#
+# Justified by src/topo_headroom_probe.py (job 20580274, 45 cells/split x 4 draws,
+# NFE 32; see N19_TOPO_HEADROOM_ASSESSMENT.md):
+#   oracle_frac(d_b1) = 0.692 test / 0.604 val   (>=0.25 PASS)
+#   d_b1_curve = -0.467 [-0.673,-0.258] vs a topology-preserving warp null of -0.041
+#   5/6 regimes UNDER-produce, no_hydro_stripes OVER-produces
+# Those numbers are from best.pt (ep 1270). Because this arm warm-starts from
+# ep 4075 instead (see pretrained_checkpoint), the probe was re-run against
+# frozen_ep4075_posttrain_base (job 20739443) and the defect transfers intact:
+#   oracle_frac = 0.657 test / 0.598 val, d_b1_curve = -0.435 / -0.319,
+#   per-regime signs unchanged (5/6 under-produce, stripes over-produce).
+#
+# Differences from the N12/N13 arm, each traceable to a measurement or to the
+# 3-field layout -- everything else is held at the N13 values.
+
+Demo_Num: 20
+device_ids: [0]
+dataset: active_emulsion
+save_dir: Save_TrainedModel/ffm_ae_pointcloud_selfmutObsN20
+# 5000 epochs exceeds the 48h QOS wall for the topology arm (~52 s/epoch measured
+# => ~73h), so this run must resume across job ids. RELOAD warm-starts from the
+# frozen base while no run dir exists, then resumes that run dir on resubmission.
+# Never --requeue: requeued tasks double-book their GPUs in QOS usage.
+RELOAD: true
+
+training_mode: direct_coherence
+initialization: pretrained
+pretrained_run_dir: Save_TrainedModel/ffm_ae_pointcloud_joint_sr_pool_fieldwise_DemoN19_20260815_135810
+pretrained_source_Demo_Num: null
+# Immutable 0444 copy of the base's FINAL checkpoint (last.pt, epoch 4075), matching
+# the N12/N13 protocol of warm-starting from the converged plateau rather than a
+# val-selected checkpoint. Note the tradeoff taken here: N19's val bottomed at
+# 0.5153 (ep 1270) and drifted to 0.5293 by ep 4075 while train fell to 0.495, so
+# this base is ~2.7% worse on val but better fit and protocol-consistent with the
+# earlier arms. Never point this at the mutable last.pt itself.
+pretrained_checkpoint: frozen_ep4075_posttrain_base
+pretrained_min_epoch: 4000
+pretrained_load_optimizer: false
+pretrained_strict: true
+pretrained_use_source_base_config: true
+pretrained_allow_stats_mismatch: false
+
+# Dataset identity -- matches the N19 base exactly.
+ae_data_root: ~/orcd/pool/active_emulsion_dataset/data_half_885
+ae_protocol: interp
+ae_fields: [phi, vx, vy]               # 3 fields: no w channel, vorticity is derived.
+ae_splits_path: null
+ae_flow_transform: asinh
+ae_frame_downsample: true
+ae_frame_tau: 0.02
+ae_frame_min: 4
+ae_augment: translate_rot90
+
+# Parameter conditioning.
+param_conditioning: true
+param_n_freq: 4
+param_jitter: 0.1
+param_dropout: 0.1
+param_embed_hidden: 128
+
+seed: 42
+epochs: 5000
+batch_size: 32
+lr: 3.0e-5
+weight_decay: 1.0e-4
+num_workers: 4
+train_ratio_downsample: 0.5
+
+# Coherence application.
+direct_coherence_enabled: true
+gradient_balance_mode: weighted_sum
+data_loss_weight: 1.0
+topo_objective_mode: constrained
+# RESTORED to 0.05 (2026-08-19). The 0.15 loosening used on the failed N20 run was
+# tuned against an artifact of the mode-mismatch bug: the anchor pred was computed
+# with dropout ACTIVE, which puts a noise floor of ~3.2e-02 under the anchor even at
+# model == base. The 80-epoch pilot's budget (0.05 * baseline = 2.605e-02) sat BELOW
+# that floor, so mu_anchor was pinned at 0.82-0.94 regardless of actual drift -- the
+# "anchor smothering the topology term" that motivated 0.15 was the noise floor, not
+# drift. With the fix (data/anchor pred now eval-mode, like the topology rollouts and
+# validation), the anchor starts at exactly 0 and the whole 0.05 budget is real drift
+# allowance. Keeping 0.15 with a real anchor would permit ~3x the intended function
+# drift (worst-case val RF ~ (sqrt(0.52)+sqrt(0.078))^2 ~ 1.1, vs ~0.78 at 0.05).
+# Watch anchor_ema in the [dual] lines -- it must start at 0.000e+00 now; a nonzero
+# epoch-1 value means the mode fix regressed.
+anchor_budget_frac: 0.05
+dual_lr: 0.01
+dual_max: 1.0e+3
+dual_loss_ema_decay: 0.95
+topo_rollout_backprop_k: 1
+# (The val-RF fuse that could permanently zero the topology term mid-run has been
+# deleted from the trainer. Feasibility is enforced by the duals during training and
+# by Pareto selection on the deliverable, which refuses to select rather than ship an
+# infeasible model. Nothing can silently end the treatment any more.)
+gradient_diagnostics_every_n_steps: 0
+gradient_clip_norm: 1.0
+coherence_every_n_steps: 8
+coherence_start_epoch: 1
+coherence_batch_size: 4
+config_missing_behavior: error
+config_data_grad_scale: 1.0
+config_coherence_grad_scale: 1.0
+epi_rollout_steps: 8
+topo_prediction_path: rollout
+topo_rollout_full_grid: true
+# CHANGED vs N13 (default_hard): obs_grid_pool observations are 8x8 / 16x16 block
+# MEANS, not pixel values. The trainer hard-errors on default_hard with pooling,
+# and endpoint_smooth's Gaussian can itself imprint the coarse lattice.
+topo_obs_consistency_mode: none
+
+# Phi topology and anchor-level-set mutual coherence.
+topo_mode: betti_self_mutual
+topo_target: marginal
+# Kept at 64: the defect is already resolved there (11x separation from the warp
+# null), and 64 is the grid the headroom numbers were measured on. Raising to 128
+# would quadruple the per-level union-find cost for no measured gain -- the
+# interface-scale geometric error that motivated 128 is not what this term targets.
+topo_grid_h: 64
+topo_grid_w: 64
+topo_n_points: 16384
+topo_idx_seed: 0
+topo_antialias_downsample: true
+topo_presmooth_sigma: 1.0
+topo_periodic_grid: true
+topo_channels: [0]                     # phi
+topo_homology_dims: [0, 1]
+
+# Cell weights. Measured partial correlation with the self cell (controlling for
+# relative L2) and separation from each cell's own null, on this base:
+#   mutual_h1  partial +0.73/+0.65, 2.19x null  -> 73% redundant with self_h1
+#   mutual_h0  partial +0.17/+0.18, 1.47x null  -> largely independent
+#   spatial    partial +0.06/-0.06, 3.05x null  -> orthogonal, strongest separation
+topo_self_h0_weight: 1.0
+topo_self_h1_weight: 1.0
+topo_mutual_h0_weight: 0.5
+topo_mutual_h1_weight: 0.125           # CHANGED (0.5): redundant with self_h1.
+topo_mutual_spatial_weight: 0.75       # CHANGED (0.5): orthogonal and best-separated.
+topo_filtration_direction: both
+topo_betti_match_saliency: zscore
+
+# Per-stratum mean self-topology. `penalty: both` plus the regime_m stratifier is
+# what makes this arm correct for a SIGNED, regime-dependent defect: each stratum
+# gets its own reference curve, so the droplet/spiral strata are pushed to CREATE
+# structure while no_hydro_stripes is pushed to suppress it. A global (unstratified)
+# target would partially cancel the two groups.
+topo_marginal_penalty: both
+topo_marginal_quantiles: [0.3, 0.5, 0.7, 0.85, 0.95]
+topo_marginal_level_mode: physical
+topo_marginal_physical_levels: [-0.4, -0.2, 0.0, 0.2, 0.4]
+topo_marginal_ema_decay: 0.9
+topo_marginal_variance_weight: 0.1
+topo_marginal_beta: 12.0
+topo_marginal_kappa: 12.0
+topo_marginal_stratify_key: regime_m
+topo_marginal_reference_path: null
+marginal_ref_max_snaps: 1024
+
+# CHANGED vs N13 (0.5 / 0.5): this base has no w channel, so the w - alpha*curl v
+# residual is undefined. Divergence alone is computable but is a SEPARATE hypothesis;
+# including it would confound attribution of any topology gain, since the control
+# disables the whole coherence path. Channels are still set in range so no code
+# path can index past C=3.
+physics_w_curl_weight: 0.0
+physics_divergence_weight: 0.0
+physics_w_channel: 0
+physics_vx_channel: 1                  # CHANGED (2): 3-field layout.
+physics_vy_channel: 2                  # CHANGED (3): 3-field layout.
+
+# Mutual anchor settings.
+topo_mutual_anchor_source: observed
+topo_mutual_anchor_channels: [1, 2]    # CHANGED (was [2,3]): vx, vy in the 3-field layout.
+topo_mutual_anchor_provider: vorticity # |curl v|
+topo_mutual_carrier_gauge: interface   # Sign-invariant |grad phi|
+topo_mutual_reduction: curve           # Creation-capable; required for an under-producing base.
+topo_mutual_r2_warn: 0.8
+# CHANGED vs N13 (0.5 each): the output-mutual cells anchor generated phi to
+# GENERATED vorticity, and this base's velocity is its broken half (rel-L2 0.47,
+# flat since epoch 400). Anchoring placement to a field that wrong is not a signal.
+topo_output_mutual_h0_weight: 0.0
+topo_output_mutual_h1_weight: 0.0
+topo_output_mutual_spatial_weight: 0.0
+topo_component_balance_enabled: true
+topo_component_balance_ema_decay: 0.9
+topo_component_balance_refresh_steps: 8
+topo_component_balance_min_scale: 0.02
+topo_component_balance_max_scale: 20.0
+topo_component_balance_eps: 1.0e-8
+topo_require_full_cell_coverage: true
+topo_min_mutual_valid_fraction: 0.95
+
+# Mutual slice family.
+topo_bifilt_carrier_channel: 0
+topo_bifilt_second_channel: 1          # CHANGED (was 1 = w; now 1 = vx). Must differ from the carrier.
+topo_bifilt_second_provider: abs_channel
+topo_bifilt_n_lines: 4
+topo_bifilt_theta_min_deg: 15.0
+topo_bifilt_offset_q_lo: 0.05
+topo_bifilt_offset_q_hi: 0.95
+topo_bifilt_axis_map: reference_zscore
+
+# Model architecture -- must match the N19 source exactly (fieldwise gather).
+data: Dataset
+backbone: GL_rbf_ENH
+hidden_dim: 256
+cond_dim: 128
+field_embed_dim: 128
+sigma_min: 1.0e-4
+rbf_sigma: 0.06299212598425197
+latent_dim: 256
+num_latents: 128
+num_heads: 8
+num_latent_blocks: 4
+ff_mult: 4
+attn_dropout: 0.1
+mlp_dropout: 0.1
+decode_chunk_size: 4096
+share_query_proj: false
+summary_type: mean
+gather_mode: topk_rbf_glres
+gather_topk: 32
+sensor_local_topk: 16
+gather_query_chunk_size: 2048
+fieldwise_rbf_gather: true
+rbf_sigma_per_field: [0.06299212598425197, 0.12598425196850394, 0.12598425196850394]
+periodic_coord_periods: [1.0078740157480315, 1.0078740157480315, 0.0]
+learnable_rbf_sigma: false
+adaptive_rbf_sigma: false
+neighbor_backend: keops
+sensor_local_dropout: 0.0
+use_fourier_pe: true
+pe_num_bands: 32
+pe_max_freq: 64.0
+sensor_coord_encoding: fourier
+latent_sensor_reinject: true
+latent_reinject_every: 1
+query_latent_readout: true
+query_readout_type: coord
+query_readout_scale_init: 1.0e-2
+enhanced_head_norm: true
+glres_scale_init: 1.0e-2
+Num_x: 128
+Num_y: 128
+fno_modes_x: 24
+fno_modes_y: 24
+fno_hidden_channels: 64
+fno_n_layers: 4
+condition_blur: true
+condition_blur_kernel: 15
+condition_blur_sigma: 2.5
+n_query_points: 2048
+prior: rff
+rff_features: 256
+rff_lengthscale: 0.15
+
+# Observation protocol -- identical to the N19 base.
+cond_fields: [0, 1, 2]
+n_obs_min_list: [256, 64, 64]
+n_obs_max_list: [256, 64, 64]
+obs_grid_stride_list: [8, 16, 16]
+obs_grid_pool: true
+obs_grid_pool_physical: true
+vis_cond_fields: [0, 1, 2]
+vis_n_obs_list: [256, 64, 64]
+vis_obs_grid_stride_list: [8, 16, 16]
+vis_obs_consistency_mode: none
+
+eval_every: 10
+val_coherence: true
+val_coherence_batches: 8
+pareto_selection_enabled: true
+pareto_rf_relative_tolerance: 0.02
+pareto_topology_metric: val_topo_topo_selection_loss
+pareto_rf_baseline: null
+save_every: 10
+snapshot_every: 250                    # Epoch-matched snapshots for the A/B.
+snapshot_keep: 0
+n_steps_generation: 32
+ode_solver: euler
+benchmark_n_steps: [2, 4, 8]

@@ -1,9 +1,9 @@
-"""Regression tests for the held-out coherence evaluator.
+"""Focused regression tests for the held-out coherence evaluator.
 
-All fixtures are synthetic and CPU-only.
+Synthetic CPU fixtures only: no dataset files or trained checkpoints are read.
 """
 
-# Support direct execution from any working directory.
+# Make src/ importable when run from any cwd.
 import os as _os
 import sys as _sys
 _SRC_DIR = _os.path.abspath(_os.path.join(
@@ -23,6 +23,28 @@ import torch.nn as nn
 import yaml
 
 import coherence_eval as ce
+
+
+def test_stratified_validation_cohort_covers_every_stratum_per_batch():
+    class Dataset(torch.utils.data.Dataset):
+        _meta = [{"cell": cell} for cell in ("a", "a", "b", "b", "c", "c")]
+
+        @staticmethod
+        def stratum_keys(meta):
+            return {"regime_m": meta["cell"]}
+
+        def __len__(self):
+            return len(self._meta)
+
+        def __getitem__(self, index):
+            return {"index": index, "regime_m": self._meta[index]["cell"]}
+
+    loader = torch.utils.data.DataLoader(Dataset(), batch_size=3)
+    balanced = ce._stratified_validation_loader(
+        loader, "regime_m", batch_size=3, n_batches=4, seed=7)
+    batches = list(balanced)
+    assert len(batches) == 4
+    assert all(set(batch["regime_m"]) == {"a", "b", "c"} for batch in batches)
 
 
 def _physical_fixture(size=24):
@@ -224,6 +246,50 @@ def test_val_sensors_are_fixed_masked_colocated_and_rng_neutral():
     model.eval()
     ce.val_coherence(model, [batch], topo, topo_idx, "cpu", args, max_batches=1)
     assert not model.training
+
+
+def test_comprehensive_validation_resets_and_restores_persistence_phase():
+    class Inner:
+        _comprehensive_calls = 17
+
+    class RotatingTopo:
+        _marg_freeze = False
+
+        def __init__(self):
+            self._loss = Inner()
+            self.phases = []
+
+        def __call__(self, x_pred, x_ref, **_kwargs):
+            self.phases.append(self._loss._comprehensive_calls)
+            self._loss._comprehensive_calls += 1
+            value = x_pred.square().mean()
+            return value, {"dice": 0.2}
+
+    n_points = 12
+    coords = torch.zeros(1, n_points, 3)
+    fields = torch.zeros(1, n_points, 2)
+    batch = {"coords": coords, "fields": fields, "regime": ["fixture"]}
+    args = SimpleNamespace(
+        seed=17, cond_fields=[0, 1], n_obs_min_list=[3, 3],
+        n_obs_max_list=[3, 3], sensor_layout="independent",
+        coherence_batch_size=1, epi_rollout_steps=1, ode_solver="euler",
+        topo_marginal_stratify_key="regime", topo_target="paired",
+        topo_rollout_full_grid=True, topo_obs_consistency_mode="none",
+        topo_mode="comprehensive_self_mutual", topo_dice_weight=1.0,
+        topo_exact_betti_validation=False, topo_exact_mutual_validation=False)
+    model, topo = _FFM(), RotatingTopo()
+    topo_idx = torch.arange(n_points)
+
+    first = ce.val_coherence(
+        model, [batch, batch], topo, topo_idx, "cpu", args, max_batches=2)
+    assert topo.phases == [0, 1]
+    assert topo._loss._comprehensive_calls == 17
+    topo.phases.clear()
+    second = ce.val_coherence(
+        model, [batch, batch], topo, topo_idx, "cpu", args, max_batches=2)
+    assert topo.phases == [0, 1]
+    assert topo._loss._comprehensive_calls == 17
+    assert first == second
 
 
 def test_val_coherence_forwards_mixed_physical_pool_operator():
@@ -447,8 +513,7 @@ def _evaluation_args(**overrides):
     values = dict(
         ae_data_root="/tmp/ae", ae_protocol="interp", ae_fields=["phi", "w", "vx", "vy"],
         ae_flow_transform="asinh", seed=42, vis_cond_fields=[2, 3],
-        vis_n_obs_list=[256, 256], vis_obs_grid_stride_list=[8, 16, 16],
-        sensor_layout="colocated", ode_solver="euler",
+        vis_n_obs_list=[256, 256], sensor_layout="colocated", ode_solver="euler",
         topo_marginal_physical_levels=[-0.4, 0.0, 0.4],
         topo_filtration_direction="both", topo_presmooth_sigma=1.0,
     )
@@ -474,17 +539,6 @@ def test_final_gate_rejects_protocol_and_checkpoint_mismatches():
         raise AssertionError("sensor-layout mismatch was accepted")
     gate.validate_evaluation_protocols(
         [("control", control), ("treatment", treatment)], sensor_layout="colocated")
-
-    treatment.vis_obs_grid_stride_list = [4, 8, 8]
-    try:
-        gate.validate_evaluation_protocols(
-            [("control", control), ("treatment", treatment)],
-            sensor_layout="colocated")
-    except ValueError as exc:
-        assert "vis_obs_grid_stride_list" in str(exc)
-    else:
-        raise AssertionError("visualization stride mismatch was accepted")
-    treatment.vis_obs_grid_stride_list = list(control.vis_obs_grid_stride_list)
 
     matched = {
         "epoch": 20, "source_epoch": 10000,

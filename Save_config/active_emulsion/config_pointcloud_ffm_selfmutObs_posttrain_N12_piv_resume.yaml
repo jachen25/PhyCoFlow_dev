@@ -1,4 +1,4 @@
-# N13 topology arm with checkpoint reload enabled.
+# Resume N13 topology arm; only RELOAD differs.
 
 Demo_Num: 13
 device_ids: [0]
@@ -10,7 +10,7 @@ training_mode: direct_coherence
 initialization: pretrained
 pretrained_run_dir: Save_TrainedModel/ffm_ae_pointcloud_piv_half_DemoN12_20260810_211156
 pretrained_source_Demo_Num: null
-pretrained_checkpoint: frozen_ep3615_posttrain_base  # Immutable source checkpoint.
+pretrained_checkpoint: frozen_ep3615_posttrain_base  # Immutable copy of the base's final plateau checkpoint (never a mutable last.pt).
 pretrained_min_epoch: 3000
 pretrained_load_optimizer: false
 pretrained_strict: true
@@ -26,7 +26,7 @@ ae_flow_transform: asinh
 ae_frame_downsample: true
 ae_frame_tau: 0.02
 ae_frame_min: 4
-# Training augmentation shared by both comparison arms.
+# Train-only regularizer; matched across arms.
 ae_augment: translate_rot90
 
 # Parameter conditioning.
@@ -42,26 +42,27 @@ weight_decay: 1.0e-4
 num_workers: 4
 train_ratio_downsample: 0.5
 
-# Post-training objective.
+# Coherence application.
 direct_coherence_enabled: true
 gradient_balance_mode: weighted_sum
 data_loss_weight: 1.0
-# Constrained objective:
-#   min L_topo, subject to L_data <= baseline * (1 + pareto_rf_relative_tolerance)
-#                          L_anchor <= anchor_budget_frac * baseline
-# Projected dual ascent uses EMA-smoothed constraint losses. The function-space
-# anchor E||v_theta - v_base||^2 limits drift from the frozen source model.
-# L_topo is normalized by its initial value and adjusted for update cadence.
+# Constrained topology post-training:
+#   min L_topo  s.t.  L_data <= baseline*(1+pareto_rf_relative_tolerance),
+#                     L_anchor <= anchor_budget_frac * baseline
+# Primal: Adam on theta. Dual: projected ascent on (mu_data, mu_anchor) from
+# EMA-smoothed constraint losses. The anchor is E||v_theta - v_base||^2 to the
+# frozen source (function-space L2-SP); it bounds drift in the null space of
+# the data loss, which a loss budget alone cannot see. The topology objective
+# is normalized once by its initial value and cadence-scaled; the data term
+# acts only through its multiplier.
 topo_objective_mode: constrained
 anchor_budget_frac: 0.05
 dual_lr: 0.01
 dual_max: 1.0e+3
 dual_loss_ema_decay: 0.95
-# DRaFT-1 differentiates only the final rollout step to control gradients.
+# DRaFT-1: backprop through only the last rollout step; full-depth backprop
+# through the unrolled solver produces chaotic gradient amplification.
 topo_rollout_backprop_k: 1
-# Validation RF-loss guard; the anchor constraint is the primary drift control.
-val_rf_guard: true
-val_rf_guard_patience: 1
 gradient_diagnostics_every_n_steps: 0
 gradient_clip_norm: 1.0
 coherence_every_n_steps: 8
@@ -70,9 +71,7 @@ coherence_batch_size: 4
 config_missing_behavior: error
 config_data_grad_scale: 1.0
 config_coherence_grad_scale: 1.0
-# When enabled, training and in-training Pareto coherence use 8 NFE.
-# Standalone held-out evaluation defaults to 32 NFE.
-epi_rollout_steps: 8
+epi_rollout_steps: 8                    # Rollout NFE for the topology term; held-out gates still evaluate at NFE=32.
 topo_prediction_path: rollout
 topo_rollout_full_grid: true
 topo_obs_consistency_mode: default_hard
@@ -87,7 +86,7 @@ topo_idx_seed: 0
 topo_antialias_downsample: true
 topo_presmooth_sigma: 1.0
 topo_periodic_grid: true
-topo_channels: [0]                     # Phase field.
+topo_channels: [0]                     # phi
 topo_homology_dims: [0, 1]
 
 # Self and mutual Betti cells.
@@ -114,14 +113,14 @@ topo_marginal_beta: 12.0
 topo_marginal_kappa: 12.0
 # Stratify by dynamics and mean composition.
 topo_marginal_stratify_key: regime_m
-topo_marginal_reference_path: null     # Computed from the training split at startup.
-marginal_ref_max_snaps: 1024           # Reference-snapshot cap across regime_m strata.
+topo_marginal_reference_path: null     # Auto-precomputed from the train split at startup.
+marginal_ref_max_snaps: 1024           # Cover every regime_m stratum.
 
 # Mutual anchor settings.
 topo_mutual_anchor_source: observed
-topo_mutual_anchor_channels: [2, 3]    # Reference velocity channels.
-topo_mutual_anchor_provider: vorticity # Magnitude of curl(v).
-topo_mutual_carrier_gauge: interface   # Sign-invariant magnitude of grad(phi).
+topo_mutual_anchor_channels: [2, 3]    # Dense/reference vx, vy.
+topo_mutual_anchor_provider: vorticity # |curl v|
+topo_mutual_carrier_gauge: interface   # Sign-invariant |grad phi|
 topo_mutual_reduction: curve
 topo_mutual_r2_warn: 0.8
 topo_mutual_spatial_weight: 0.5
@@ -147,7 +146,7 @@ topo_bifilt_offset_q_lo: 0.05
 topo_bifilt_offset_q_hi: 0.95
 topo_bifilt_axis_map: reference_zscore
 
-# Model architecture inherited from the source checkpoint.
+# Model architecture; inherited values must match the source.
 data: Dataset
 backbone: GL_rbf_ENH
 hidden_dim: 256

@@ -3,7 +3,7 @@
 
 The first arm is the reference. All arms must use matched checkpoints and protocols.
 
-Example:
+USAGE
   python evaluate_topo_coherence_test.py \
       --run-dirs control=/path/to/control topology=/path/to/topology \
       --split test --n-snapshots 60 --k-draws 8 --n-steps 32 \
@@ -46,8 +46,7 @@ _TRAINING_PROTOCOL_KEYS = frozenset({
     "enhanced_head_norm", "glres_scale_init", "Num_x", "Num_y",
     "n_query_points", "prior", "rff_features", "rff_lengthscale", "sigma_min",
     "cond_field", "cond_fields", "n_obs_min", "n_obs_max", "n_obs_min_list",
-    "n_obs_max_list", "obs_grid_stride_list", "vis_obs_grid_stride_list",
-    "obs_grid_pool",
+    "n_obs_max_list", "obs_grid_stride_list", "obs_grid_pool",
     "obs_grid_pool_physical", "use_ema", "ema_decay", "training_mode",
     "initialization", "pretrained_run_dir", "pretrained_source_Demo_Num",
     "pretrained_checkpoint", "pretrained_min_epoch", "pretrained_load_optimizer",
@@ -153,9 +152,6 @@ def evaluation_protocol(args, sensor_layout=None):
         "ae_data_root", "ae_protocol", "ae_fields", "ae_flow_transform",
         "seed", "vis_cond_fields", "vis_n_obs_list")
     protocol = {key: getattr(args, key) for key in required}
-    protocol["vis_obs_grid_stride_list"] = getattr(
-        args, "vis_obs_grid_stride_list",
-        getattr(args, "obs_grid_stride_list", None))
     protocol.update({key: getattr(args, key, default)
                      for key, default in defaults.items()})
     if sensor_layout is not None:

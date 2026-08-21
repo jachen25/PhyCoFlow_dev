@@ -1,4 +1,5 @@
-"""Finite-grid RCC8 classifier.
+"""
+Finite-grid RCC8 classifier.
 
 RCC8 (Region Connection Calculus, 8 base relations) is a qualitative spatial
 calculus.  Given two regions ``A`` and ``B`` it names their topological
@@ -13,7 +14,7 @@ relationship with one of:
     TPPi  inverse TPP                   (B inside A, boundaries touch)
     NTPPi inverse NTPP                  (B strictly inside A)
 
-On a discrete pixel grid these idealized relations require tolerances. The
+On a discrete pixel grid these idealized relations need tolerances.  The
 classifier uses areas, intersection/union, containment ratios, and
 morphological boundary/contact tests, with an ``eps_area`` slack so that
 "equal" and "proper part" survive single-pixel rasterization noise.
@@ -102,7 +103,9 @@ def classify_pair(
         cfg: :class:`RCCConfig` (defaults if None).
 
     Returns:
-        One of :data:`RCC8_RELATIONS`, or ``None`` if both masks are empty.
+        One of :data:`RCC8_RELATIONS`, or ``None`` if *both* masks are empty
+        (a deliberately ignored pair: there is no relation between two
+        non-regions).
 
     Raises:
         ValueError: on shape mismatch or non-boolean-coercible input.
@@ -133,29 +136,29 @@ def classify_pair(
 
     hi = 1.0 - cfg.eps_area
 
-    # Equal regions.
+    # --- EQ: essentially the same region -------------------------------------
     # Mutual near-containment also counts as EQ: a_in_b >= hi and b_in_a >= hi
     # admits IoU as low as hi/(2-hi) < hi, which the IoU test alone would
     # mislabel PO.
     if iou >= hi or (a_in_b >= hi and b_in_a >= hi):
         return "EQ"
 
-    # Non-overlapping regions are externally connected or disconnected.
+    # --- no overlap: either touching (EC) or fully apart (DC) ----------------
     if overlap == 0:
         externally_touching = bool(
             (ndi.binary_dilation(a, structure=st) & ndi.binary_dilation(b, structure=st)).any()
         )
         return "EC" if externally_touching else "DC"
 
-    # A is a proper part of B.
+    # --- A is a proper part of B ---------------------------------------------
     if a_in_b >= hi and b_in_a < hi:
         return "TPP" if boundaries_touch(a, b, st) else "NTPP"
 
-    # B is a proper part of A.
+    # --- B is a proper part of A ---------------------------------------------
     if b_in_a >= hi and a_in_b < hi:
         return "TPPi" if boundaries_touch(a, b, st) else "NTPPi"
 
-    # Partial overlap.
+    # --- genuine partial overlap ---------------------------------------------
     return "PO"
 
 
@@ -205,7 +208,9 @@ def classify_pair_bbox(
     return classify_pair(a[crop], b[crop], cfg)
 
 
-# Geometric diagnostics used by surrogate checks.
+# -----------------------------------------------------------------------------
+# Convenience metrics (used by the soft-surrogate sanity checks and debugging)
+# -----------------------------------------------------------------------------
 
 def pairwise_metrics(a: np.ndarray, b: np.ndarray, eps: float = 1e-8) -> dict:
     """Return the scalar geometric quantities behind the classification."""
@@ -226,7 +231,11 @@ def pairwise_metrics(a: np.ndarray, b: np.ndarray, eps: float = 1e-8) -> dict:
 
 
 def empty_distribution() -> np.ndarray:
-    """Return a zero distribution over the eight RCC relations."""
+    """Zero distribution over the 8 RCC relations.
+
+    Returned by the profile builder when a (field, threshold) pair has no
+    components to relate, so downstream code never sees NaN.
+    """
     return np.zeros(len(RCC8_RELATIONS), dtype=np.float64)
 
 

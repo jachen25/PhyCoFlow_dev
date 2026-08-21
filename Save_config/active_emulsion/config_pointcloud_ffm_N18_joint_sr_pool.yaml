@@ -1,18 +1,28 @@
-# N18 joint pooled super-resolution baseline.
+# N18 joint super-resolution base: BOTH fields observed coarsely, as pooled
+# regular grids — the experimentally faithful sensing setup (see PRL 136,
+# 254001: v is instantaneously slaved to phi via Stokes, so phi+v+params is
+# the complete observable state; Hokmabad et al. PRX 2021 for the dual-channel
+# phi + micro-PIV measurement protocol this mirrors).
 #
-# Conditioning uses pooled regular grids:
-#   phi: 8x8 block means, yielding 256 observations on a 16x16 grid.
-#   vx, vy: 16x16 block means, yielding 64 co-located velocity vectors.
-# This matches a dual-channel fluorescence and micro-PIV measurement protocol.
-# Stokes damping concentrates velocity energy at scales resolved by the coarse
-# PIV grid. The model reconstructs full-resolution phi, vx, and vy; vorticity
-# is derived as w = dvx/dy - dvy/dx.
+# Conditioning:
+#   phi     : 8x8 block MEANS on the 128x128 grid -> 16x16 = 256 pooled obs
+#             (low-magnification fluorescence camera; pixel = block average).
+#   vx, vy  : 16x16 window MEANS -> 8x8 = 64 vectors, BOTH components at the
+#             SAME block centroids (micro-PIV interrogation windows; identical
+#             strides colocate automatically). Stokes k^-2 damping concentrates
+#             v energy at large scales, so the coarse PIV grid captures the
+#             dominant flow content that phi-only N16/N17 conditioning proved
+#             unable to determine (v rel-L2 ~1.0-1.4 = unconditioned sampling).
+# Total 384 observations. The model generates full-resolution phi, vx, vy;
+# vorticity is derived as w = dvx/dy - dvy/dx (w_from_v panel).
 #
-# Block means are not pointwise constraints, so sampling uses endpoint_smooth
-# without a final hard clamp. The smoothing scale 0.08 lies between the phase
-# cell size (8/127) and velocity cell size (16/127).
+# Pooled observations are block means, never hard-clamped: sampling
+# auto-switches to endpoint_smooth with no final clamp
+# (resolve_pooled_obs_consistency). Single smooth sigma 0.08 splits the phi
+# cell (8/127=0.063) and PIV cell (16/127=0.126) scales.
 #
-# Translation and 90-degree rotation augmentation preserve both sensor grids.
+# translate/rot90 augmentation moves the field under both fixed sensor grids.
+# A/B ladder: N16 (decimated phi-only) / N17 (pooled phi-only) / N18 (joint).
 
 Demo_Num: 18
 device_ids: [0]
@@ -35,7 +45,8 @@ num_workers : 12
 
 initialization: "scratch"
 
-# H, R, and m are calibrated experiment parameters available at inference.
+# Generating parameters (H, R, m) are experiment control knobs, known at
+# inference (material constants from calibration); same recipe as N15-N17.
 param_conditioning: true
 param_n_freq: 4
 param_jitter: 0.1
@@ -104,8 +115,9 @@ snapshot_every : 10000
 snapshot_keep : 1
 n_steps_generation : 32
 
-# Phi uses stride 8; vx and vy use stride 16 and share block centroids.
-# Strided fields ignore the observation bounds, which remain length-matched.
+# phi (0) on the 8-stride pooled grid; vx (1) and vy (2) on the 16-stride
+# pooled grid (colocated by construction). The n_obs bounds are ignored for
+# strided fields but must be present and length-matched.
 cond_fields :   [0, 1, 2]
 n_obs_min_list: [256, 64, 64]
 n_obs_max_list: [256, 64, 64]

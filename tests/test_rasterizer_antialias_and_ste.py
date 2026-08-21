@@ -1,8 +1,8 @@
-"""Test grid anti-aliasing and Betti STE descent directions."""
+"""Focused checks for grid anti-aliasing and Betti STE descent directions."""
 
 from __future__ import annotations
 
-# Support direct execution from any working directory.
+# Make src/ importable when run from any cwd.
 import os as _os
 import sys as _sys
 _SRC_DIR = _os.path.abspath(_os.path.join(

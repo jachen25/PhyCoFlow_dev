@@ -1,0 +1,112 @@
+# Corrected N22: comprehensive self and generated-phi/generated-vorticity
+# topological post-training on the frozen N19 source.
+extends: config_pointcloud_ffm_selfmutObs_posttrain_N19.yaml
+
+Demo_Num: 22
+save_dir: Save_TrainedModel/ffm_ae_pointcloud_comprehensiveN22
+RELOAD: true
+epochs: 1000
+
+# Balance every update across all 12 regime_m strata.
+topo_stratified_train_batches: true
+topo_min_train_strata: 12
+coherence_batch_size: 12
+# Eleven updates/epoch expose 132 stratified samples while leaving room for the
+# CPU persistence calculation.
+coherence_every_n_steps: 16
+
+# Randomized one-step endpoint credit reaches all flow times without a full ODE
+# backward. Validation still uses the deployed 32-step trajectory.
+epi_rollout_steps: 16
+topo_rollout_gradient_mode: random_step
+topo_rollout_backprop_k: 0
+val_coherence_rollout_steps: 32
+
+# Replace clip-to-unit-direction with a scheduled topology/data norm ratio.
+topo_normalize_constrained_gradient: true
+topo_gradient_ratio_start: 0.25
+topo_gradient_ratio_end: 0.05
+topo_gradient_ratio_decay_epochs: 1000
+gradient_clip_norm: 0.0
+gradient_diagnostics_every_n_steps: 1
+
+# Eleven complementary TDA/spatial surfaces:
+#   self: H0/H1 curves, H0/H1 persistence, region overlap, connectivity
+#   mutual: phi-vorticity sliced H0/H1 curves and persistence, spatial placement
+topo_mode: comprehensive_self_mutual
+topo_target: paired
+topo_homology_dims: [0, 1]
+topo_channels: [0]
+topo_filtration_direction: both
+topo_superlevel_level_mode: physical
+topo_superlevel_physical_levels: [-0.8, -0.6, -0.4, -0.2, 0.0, 0.2, 0.4, 0.6, 0.8]
+topo_superlevel_sharpness: 8.0
+topo_self_h0_weight: 1.0
+topo_self_h1_weight: 1.0
+topo_self_persistence_h0_weight: 0.25
+topo_self_persistence_h1_weight: 0.25
+topo_dice_weight: 1.0
+topo_cldice_weight: 0.25
+topo_cross_dice_weight: 0.0
+
+# Both mutual fields are generated: phi is channel 0 and vorticity is derived
+# differentiably from generated vx/vy channels 1/2.
+topo_mutual_anchor_source: generated
+topo_mutual_anchor_channels: [1, 2]
+topo_mutual_anchor_provider: vorticity
+topo_mutual_carrier_gauge: interface
+topo_bifilt_carrier_channel: 0
+topo_bifilt_n_lines: 4
+topo_bifilt_line_sampling: fan
+topo_marginal_quantiles: [0.15, 0.3, 0.45, 0.6, 0.75, 0.9]
+topo_output_mutual_curve_loss: nmae
+topo_output_mutual_h0_weight: 1.0
+topo_output_mutual_h1_weight: 1.0
+topo_output_mutual_persistence_h0_weight: 0.25
+topo_output_mutual_persistence_h1_weight: 0.25
+topo_output_mutual_spatial_weight: 1.0
+topo_matching_backend: induced
+topo_lambda_spatial_self: 0.0
+topo_lambda_spatial_mutual: 0.0
+# All 12 strata feed curves/spatial terms before every backward. Barcode terms
+# rotate one position per train call; evaluation uses 3 x 4 batches = 12 samples.
+topo_persistence_train_batch_size: 1
+topo_persistence_eval_batch_size: 3
+
+# Disable the old marginal/observed-anchor cells; they target a different
+# statistic and must not diverge from the selection objective.
+topo_mutual_h0_weight: 0.0
+topo_mutual_h1_weight: 0.0
+topo_mutual_spatial_weight: 0.0
+topo_marginal_variance_weight: 0.0
+topo_component_balance_enabled: false
+topo_require_full_cell_coverage: true
+topo_min_mutual_valid_fraction: 0.95
+
+# The weighted held-out score mirrors training. Per-surface guards prevent an
+# aggregate gain from hiding a regression in components, loops, connectivity,
+# persistence, or the phi-vorticity relation.
+topo_exact_betti_validation: true
+topo_exact_mutual_validation: true
+topo_stratified_val_batches: true
+val_coherence_batches: 4
+pareto_topology_metric: val_comprehensive_topology_score
+pareto_require_topology_improvement: true
+pareto_topology_guard_metrics:
+  - val_exact_h0_curve_nmae
+  - val_exact_h1_curve_nmae
+  - val_topo_self_persistence_h0
+  - val_topo_self_persistence_h1
+  - val_exact_mutual_h0_nmae
+  - val_exact_mutual_h1_nmae
+  - val_topo_output_mutual_persistence_h0
+  - val_topo_output_mutual_persistence_h1
+  - val_exact_mutual_spatial_error
+  - val_topo_dice
+  - val_topo_cldice
+pareto_topology_guard_relative_tolerance: 0.05
+pareto_topology_guard_absolute_tolerance: 0.005
+topology_go_no_go_epoch: 100
+eval_every: 10
+save_every: 10
+snapshot_every: 10

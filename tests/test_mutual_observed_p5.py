@@ -1,10 +1,19 @@
-"""Test observed-mutual reductions, batching, and validation.
+"""CPU tests for _mutual_observed_loss.
 
-Coverage includes combined reduction, per-sample normalization, constant
-carriers, homology-dimension gating, and invalid configurations.
+  T-both     reduction='both' runs and is location-sensitive (match + curve summed).
+  T-batchcomp a low-magnitude mislocated sample batched with high-magnitude matched
+             samples still receives a nonzero carrier gradient (per-sample
+             standardization/levels); batch-global standardization collapses it to ~0.
+  T-const    a batch containing a constant-carrier sample does not crash; it is
+             skipped (mutual_valid_frac < 1) and the loss stays finite.
+  T-gate     homology_dims is the authoritative active-dimension set; mutual_h1
+             is inactive when homology_dims=[0] even with a nonzero weight.
+  T-valid    symmetric_min+curve, symmetric_min+super, and source=observed on a
+             non-betti_self_mutual mode all raise at config time.
+Run: python test_mutual_observed_p5.py
 """
 
-# Support direct execution from any working directory.
+# Make src/ importable when run from any cwd.
 import os as _os
 import sys as _sys
 _SRC_DIR = _os.path.abspath(_os.path.join(
@@ -67,7 +76,7 @@ def _loss(cfg):
 
 
 def _stack(samples):
-    """Stack carrier and anchor samples into a ``[B, 2, H, W]`` tensor."""
+    """samples: list of (carrier[H,W], anchor[H,W]) -> [B,2,H,W]."""
     return torch.tensor(np.stack([np.stack([c, a]) for c, a in samples]), dtype=torch.float64)
 
 
@@ -81,7 +90,7 @@ def run(loss, gp, gt, seed=0):
     return tot, m, gp
 
 
-# Combined match and curve reduction.
+# T-both
 lb = _loss(_cfg(reduction="both"))
 true1 = _stack([(_ring(*A, 6), _disk(*A, 5))])
 on1 = _stack([(_ring(*A, 6), _disk(*A, 5))])
@@ -90,8 +99,8 @@ ton, _, _ = run(lb, on1, true1); toff, _, _ = run(lb, off1, true1)
 check("T-both runs + location-sensitive (on<off)", float(toff) > float(ton) + 1e-4,
       f"on={float(ton):.4f} off={float(toff):.4f}")
 
-# A low-magnitude minority sample remains supervised.
-# Mix one weak, mislocated sample with two strong, matched samples.
+# T-batchcomp: low-magnitude minority still supervised.
+# Sample 0: weak anchor (amp 0.3), carrier mislocated. Samples 1,2: strong anchor (amp 6), matched.
 lc = _loss(_cfg(reduction="curve"))
 trueB = _stack([
     (_ring(*A, 6), _disk(*A, 5, amp=0.3)),      # weak sample 0
@@ -109,7 +118,7 @@ g_sample0 = float(gB.grad[0, 0].abs().sum())    # carrier grad at the weak minor
 check("T-batchcomp: weak minority sample gets NONZERO carrier gradient (#1/#10 fix)",
       g_sample0 > 0, f"|g_sample0|={g_sample0:.3g}  valid_frac={mB.get('mutual_valid_frac')}")
 
-# Constant-carrier samples are skipped safely.
+# T-const: constant-carrier sample is skipped, no crash.
 flat = np.full((H, W), 0.7)                     # constant carrier -> std 0 -> skipped
 trueC = _stack([(_ring(*A, 6), _disk(*A, 5)), (flat, _disk(*Bc, 5))])
 predC = _stack([(_ring(*Bc, 6), _disk(*A, 5)), (flat, _disk(*Bc, 5))])
@@ -118,15 +127,15 @@ check("T-const: constant-carrier sample skipped, no crash, finite loss",
       np.isfinite(float(totC)) and abs(mC.get("mutual_valid_frac", 1.0) - 0.5) < 1e-6,
       f"L={float(totC):.4f} valid_frac={mC.get('mutual_valid_frac')}")
 
-# Active homology dimensions gate mutual terms.
+# T-gate: homology_dims is the authoritative active-dimension set.
 lg = _loss(_cfg(reduction="match", homology_dims=(0,), h1=1.0, h0=0.0))
 _, mg, _ = run(lg, off1, true1)
 check("T-gate: mutual_h1 is inactive when homology_dims=[0]",
       "mutual_h1" not in mg, f"metrics={sorted(k for k in mg if k.startswith('mutual_h'))}")
 
-# Configuration validation.
+# T-valid: validation guards (helpers construct then re-run __post_init__).
 def _mk_observed(**over):
-    """Build and validate an observed ``betti_self_mutual`` configuration."""
+    """Build a betti_self_mutual observed cfg via setattr, then re-validate (raises if invalid)."""
     fd = over.pop("filtration_direction", "super")
     mode = over.pop("mode", "betti_self_mutual")
     c = TopoLossConfig(mode=mode, homology_dims=(1,), mutual_h1_weight=1.0,

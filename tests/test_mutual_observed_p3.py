@@ -1,10 +1,17 @@
-"""Test observed-anchor dispatch and truth-grid propagation.
+"""Integration tests for __call__ dispatch and grids_true plumbing.
 
-Coverage includes paired and marginal targets, carrier-only gradients, and the
-generated-source compatibility path.
+Verifies the observed-anchored mutual routes end-to-end through both target
+frames and that the paired GT (x_ref) is plumbed to the marginal path (which
+normally ignores x_ref):
+  A target='paired'   + source='observed' via __call__: finite loss, gradient
+    only in the carrier channel
+  B target='marginal' + source='observed' via __call__: grids_true built and
+    passed, mutual runs
+  C back-compat: source='generated' (default) paired path still runs finite
+Run: python test_mutual_observed_p3.py
 """
 
-# Support direct execution from any working directory.
+# Make src/ importable when run from any cwd.
 import os as _os
 import sys as _sys
 _SRC_DIR = _os.path.abspath(_os.path.join(
@@ -40,13 +47,13 @@ def _disk(cx, cy, rad, s=1.2):
     return 1.0 / (1.0 + np.exp((r - rad) / s))
 
 
-# Row-major coordinates allow exact grid reconstruction.
+# Coords for all grid cells (row-major), so rasterizer.to_grid reconstructs the grid.
 yy, xx = np.mgrid[0:H, 0:W].astype(np.float32)
 COORDS = np.stack([(xx.ravel() + 0.5) / W, (yy.ravel() + 0.5) / H], axis=1)
 
 
 def _pc(carrier, anchor):
-    """Create a row-major carrier and anchor point cloud."""
+    """[1, H*W, 2] point cloud: channel 0 carrier, channel 1 anchor (row-major to match COORDS)."""
     v = np.stack([carrier.ravel(), anchor.ravel()], axis=1)     # [N,2]
     return torch.tensor(v[None], dtype=torch.float64)
 
@@ -76,7 +83,7 @@ PRED = _pc(_ring(22, 22, 6), _disk(22, 22, 5))     # carrier off, generated anch
 
 
 def main():
-    # Paired target with an observed anchor.
+    # ---- A: target='paired' + observed, via __call__ ----
     torch.manual_seed(0)
     cfg = _cfg(target="paired", source="observed"); loss = _loss(cfg)
     xp = PRED.clone().requires_grad_(True)
@@ -89,10 +96,10 @@ def main():
           f"|g_carrier|={gcar:.3g} |g_anchor|={ganc:.3g}")
     check("A mutual_h1 metric present", "mutual_h1" in m and "mutual_r2" in m)
 
-    # Marginal target with an observed anchor and truth grid.
+    # ---- B: target='marginal' + observed, via __call__ (grids_true must be built+passed) ----
     torch.manual_seed(0)
     cfgm = _cfg(target="marginal", source="observed", self_w=0.0); lossm = _loss(cfgm)
-    # Disabled self cells do not require a marginal reference.
+    # Self cells off: no marginal reference needed; install an empty ref so _load is skipped.
     lossm._marg_ref = {"levels": {}, "curves": {}, "lines": {}, "sign": {}}
     lossm._marg_u_loaded = True
     lossm._marg_ema = {}
@@ -106,14 +113,15 @@ def main():
     check("B gradient only in CARRIER channel", gcarm > 0 and gancm == 0.0,
           f"|g_carrier|={gcarm:.3g} |g_anchor|={gancm:.3g}")
 
-    # Generated-source compatibility path.
+    # ---- C: back-compat: source='generated' paired path still runs finite ----
     torch.manual_seed(0)
     cfgg = _cfg(target="paired", source="generated"); lossg = _loss(cfgg)
     xpg = PRED.clone().requires_grad_(True)
     totg, mg = lossg(xpg, TRUE)
     check("C back-compat source='generated' paired runs finite", np.isfinite(float(totg)),
           f"L={float(totg):.4f}")
-    # The generated-source path propagates gradients through both channels.
+    # The generated path reads the generated second channel, so both channels
+    # get gradient (contrast with A).
     totg.backward()
     ggen_anc = float(xpg.grad[..., 1].abs().sum())
     check("C generated path DOES use generated anchor (grad in anchor channel)", ggen_anc > 0,

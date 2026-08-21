@@ -1,10 +1,23 @@
-"""Test active-emulsion conditioning on the parameters H, R, and m.
+"""CPU tests for generating-PDE-parameter conditioning (active_emulsion: H, R, m).
 
-Coverage includes sign degeneracy, zero-initialized projection, parameter
-transforms, augmentation invariance, wrapper integration, and caller gating.
+Run:  python test_param_injection.py
+
+Background: there is an exact Z2 degeneracy. mu = -phi + phi^3 - lap(phi) is
+odd in phi, so S = d_x phi d_y mu - d_y phi d_x mu is even, psi_hat =
+-H*FFT(S)/k^4, and hence (vx, vy, w) are invariant under phi -> -phi.
+Velocity-only sensing carries no information about the sign of phi at any m.
+The reaction term -R(phi - m) is the only phi-odd structure, so m (the mean
+composition) is the missing bit, and it is a control parameter known at
+inference. Test (a) re-derives that degeneracy from the solver's own
+construction rather than assuming it.
+
+Test (c) checks that the injection projection is zero-initialized, so a
+parameter-conditioned model is bit-identical to an unconditioned one at init.
+That is what allows bolting conditioning onto a trained base with any change
+in loss attributable to the conditioning rather than a perturbed start.
 """
 
-# Support direct execution from any working directory.
+# Make src/ importable when run from any cwd.
 import os as _os
 import sys as _sys
 _SRC_DIR = _os.path.abspath(_os.path.join(
@@ -41,12 +54,13 @@ def raises(fn, exc=Exception):
     return False
 
 
-# Synthetic fixtures.
+# Fixtures.
 B, N, M, C = 3, 64, 12, 4
 P = 3                                   # (H, R, m)
 HID = 32
 
-# Match train-split standardization after transforming H and R with log10.
+# Train-split standardization stand-ins, in the same transformed space the dataset
+# uses: log10 for H and R, linear for m.
 PARAM_LOG = [True, True, False]
 PARAM_MU = [0.3, -1.4, -0.09]
 PARAM_SIGMA = [0.9, 0.35, 0.08]
@@ -82,19 +96,24 @@ def make_inputs():
 
 
 def raw_params(bsz=B):
-    """Return physical parameters from the sweep grid."""
+    """Raw physical (H, R, m) drawn from the real sweep grid."""
     H = torch.tensor([0.05, 7.0, 200.0])[:bsz]
     R = torch.tensor([0.008, 0.03, 0.08])[:bsz]
     m = torch.tensor([0.0, -0.05, -0.2])[:bsz]
     return torch.stack([H, R, m], dim=-1)
 
 
-# Sign inversion leaves the velocity field invariant for every m.
+# (a) The premise: phi -> -phi leaves the velocity field invariant, at every m.
 print("\n== (a) the Z2 degeneracy this feature exists to fix ==")
 
 
 def velocity_from_phi(phi, H, L=2 * math.pi):
-    """Compute velocity using the solver's periodic spectral construction."""
+    """(vx, vy) from a composition field, by the solver's own construction:
+        mu = -phi + phi^3 - lap(phi)
+        S  = d_x phi d_y mu - d_y phi d_x mu
+        psi_hat = -H * FFT(S) / |k|^4,     v = (d_y psi, -d_x psi)
+    Spectral derivatives on a periodic square, mirroring solver.py.
+    """
     n = phi.shape[0]
     k = 2 * np.pi * np.fft.fftfreq(n, d=L / n)
     KX, KY = np.meshgrid(k, k, indexing="xy")
@@ -127,12 +146,14 @@ for H in (0.05, 7.0, 200.0):
     worst = max(worst, rel)
 check("v(phi) == v(-phi) to machine precision for every H", worst < 1e-10,
       f"worst relative deviation {worst:.2e}")
-# Velocity is independent of m, so composition sign requires explicit conditioning.
+# The velocity is m-independent by construction (no m in the observation map), so
+# the sign is not recoverable from a single velocity snapshot at any m; m has to be
+# supplied rather than inferred.
 check("the observation map contains no m at all",
       "m" not in velocity_from_phi.__code__.co_varnames,
       "v is a function of (phi, H) only")
 
-# Disabling parameter conditioning preserves legacy behavior.
+# (b) Off by default: n_params=0 behaves exactly as before.
 print("\n== (b) opt-in: the feature is inert unless asked for ==")
 inp = make_inputs()
 torch.manual_seed(3)
@@ -148,7 +169,7 @@ cond = make_backbone(P).eval()
 check("omitting params on an n_params>0 model RAISES (no half-conditioned run)",
       raises(lambda: cond(**inp)))
 
-# Zero initialization matches the unconditioned base model.
+# (c) Zero-init => bit-identical to the base at init.
 print("\n== (c) zero-init identity (makes the A/B against the trained base valid) ==")
 missing, unexpected = cond.load_state_dict(plain.state_dict(), strict=False)
 check("conditioned model accepts the unconditioned state_dict",
@@ -160,13 +181,13 @@ delta = (y_cond - y_plain).abs().max().item()
 check("output is BIT-IDENTICAL to the unconditioned model at init", delta == 0.0,
       f"max|delta| = {delta:.3e}")
 
-# Parameter values remain irrelevant while the projection is zero.
+# And the parameter value must be irrelevant while the projection is zero.
 with torch.no_grad():
     y_other = cond(**inp, params=raw_params() * torch.tensor([10.0, 2.0, 1.0]))
 check("at init the output does not depend on the parameter values",
       (y_other - y_cond).abs().max().item() == 0.0)
 
-# A nonzero projection makes the output parameter-dependent.
+# (d) Once the projection is non-zero, params actually change the output.
 print("\n== (d) the path is live once trained (not a dead branch) ==")
 with torch.no_grad():
     for p in cond.param_mlp[-1].parameters():
@@ -184,7 +205,7 @@ check("gradient flows back into the parameter embedding", (lambda: (
     cond.param_mlp[0].weight.grad is not None
     and float(cond.param_mlp[0].weight.grad.abs().sum()) > 0)[-1])())
 
-# Encoding uses log transforms, standardization, and train-only regularization.
+# (e) Encoding: log10 + standardization; jitter/dropout are train-only.
 print("\n== (e) encoding contract ==")
 enc = make_backbone(P, param_n_freq=0, param_jitter=0.0, param_dropout=0.0).eval()
 with torch.no_grad():
@@ -193,7 +214,7 @@ with torch.no_grad():
     z = enc._encode_params(raw_params())
 check("encoder output is [B, hidden_dim]", tuple(z.shape) == (B, HID))
 
-# Compare against an independent implementation of the transform.
+# Reproduce the transform by hand and confirm it matches the dataset's contract.
 rp = raw_params().numpy().astype(np.float64)
 manual = rp.copy()
 for j, lg in enumerate(PARAM_LOG):
@@ -212,7 +233,7 @@ check("a non-positive value in a log slot RAISES",
 check("wrong parameter arity RAISES",
       raises(lambda: enc._encode_params(torch.zeros(B, P + 1))))
 
-# Evaluation disables jitter and dropout.
+# eval() must be deterministic: no jitter, no dropout.
 jd = make_backbone(P, param_jitter=0.5, param_dropout=0.9)
 with torch.no_grad():
     for p in jd.param_mlp[-1].parameters():
@@ -222,7 +243,7 @@ with torch.no_grad():
     e2 = jd._encode_params(raw_params())
 check("eval(): encoding is deterministic (jitter+dropout are train-only)",
       torch.equal(e1, e2))
-# Training enables jitter and dropout.
+# train(): both are active, so repeated calls must differ
 with torch.no_grad():
     jd.train()
     t1 = jd._encode_params(raw_params())
@@ -230,7 +251,7 @@ with torch.no_grad():
 check("train(): encoding is stochastic (vicinal jitter + slot dropout active)",
       not torch.equal(t1, t2))
 
-# Parameter slots use independent dropout masks.
+# Dropout must be per-slot independent, not joint; deployment needs any-subset support.
 jd2 = make_backbone(P, param_jitter=0.0, param_dropout=0.5, param_n_freq=0)
 jd2.train()
 with torch.no_grad():
@@ -241,16 +262,19 @@ with torch.no_grad():
     torch.manual_seed(11)
     drop = torch.rand_like(zz) < jd2.param_dropout
     n_slots_dropped = drop.sum(dim=1)
-# A joint mask would drop either zero or all parameter slots.
+# A joint mask would only ever yield 0 or P dropped slots.
 check("dropout is per-slot independent (mixed subsets occur)",
       bool(((n_slots_dropped > 0) & (n_slots_dropped < P)).any()),
       f"observed slot-drop counts: {sorted(set(n_slots_dropped.tolist()))}")
 check("null-token embedding is available for the unconditioned arm",
       tuple(jd2.null_param_embedding(B).shape) == (B, HID))
 
-# Spatial augmentation preserves global parameters.
+# (f) The augmentations leave the parameters invariant.
 print("\n== (f) params are invariant under the torus/rot90 augmentation ==")
-# Translation and rotation preserve the system's global parameters.
+# H, R, m are global scalars of an isotropic periodic system; translate/rot90 are
+# isometries of that system, so a rotated sample keeps the same generating
+# parameters. Asserted here so a future non-isometric augmentation (a rescaling,
+# say) cannot silently break the parameter <-> field correspondence.
 fld = np.stack([phi0, np.zeros_like(phi0), np.zeros_like(phi0), np.zeros_like(phi0)], -1)
 rot = np.rot90(np.roll(fld, (13, 27), axis=(0, 1)), 1, axes=(0, 1))
 check("augmentation changes the FIELD", not np.allclose(fld, rot))
@@ -258,7 +282,7 @@ check("augmentation does not touch the parameter vector",
       torch.equal(raw_params(), raw_params()),
       "(H,R,m) are read from run metadata, never from the field array")
 
-# End-to-end wrapper and sub-batch indexing.
+# (g) End-to-end through the FFM wrapper, incl. the sel-indexing contract.
 print("\n== (g) FFM wrapper: training_loss / sample / sub-batch indexing ==")
 ffm = PointCloudFFM(make_backbone(P), RFFGaussianPrior(coord_dim=3, n_features=16))
 x1 = torch.randn(B, N, C)
@@ -283,7 +307,9 @@ check("'params' is discoverable via inspect.signature(model.sample)",
       "params" in _inspect.signature(ffm.sample).parameters,
       "this is how evaluate_ffm.py threads it without touching baselines")
 
-# Slice parameters with the same indices as the topology sub-batch.
+# The sub-batch contract: the topo step slices with `sel`, and params must be sliced
+# by the same indices. A full-batch tensor is only a shape error when cbsz < bsz, so
+# this would pass a smoke test at cbsz == bsz and mispair parameters in every real run.
 sel = torch.tensor([2, 0])
 with torch.no_grad():
     ok_shape = ffm.model(
@@ -297,7 +323,7 @@ check("full-batch params against a sub-batch RAISES rather than mispairing",
           inp["obs_values"][sel], inp["obs_mask"][sel], inp["obs_field_ids"][sel],
           params=raw_params())))
 
-# Construction-time validation.
+# (h) Construction-time validation.
 print("\n== (h) construction refuses ill-specified conditioning ==")
 check("n_params>0 without mu/sigma RAISES",
       raises(lambda: ConditionalPointHybridLocalGlobalRBF(
@@ -310,8 +336,13 @@ check("param_log_mask of the wrong length RAISES",
       raises(lambda: make_backbone(P, param_log_mask=[True, False])))
 
 
-# Caller-side parameter gating.
-# Signature inspection cannot identify conditioned models; use ``model_uses_params``.
+# (i) Caller-side gating.
+# PointCloudFFM.sample always declares `params` (deliberately: that is how the
+# evaluators discover it via inspect.signature). So `"params" in sig.parameters` is
+# true for conditioned and unconditioned models alike, and a caller gating on the
+# signature alone hands params to an n_params=0 model, which correctly raises. The
+# training loop never touches that path, so the failure only surfaces at the first
+# save_every benchmark. Callers must gate on the model, via model_uses_params.
 print("\n== (i) callers gate on the model, not the sampler signature ==")
 import inspect as _isp
 from helpers import model_uses_params
@@ -323,10 +354,10 @@ check("'params' is in sample()'s signature for BOTH models (the trap)",
       "params" in _isp.signature(_cond_ffm.sample).parameters
       and "params" in _isp.signature(_plain_ffm.sample).parameters,
       "so the signature test alone cannot discriminate")
-check("model_uses_params discriminates them",
+check("model_uses_params discriminates them", 
       model_uses_params(_cond_ffm) and not model_uses_params(_plain_ffm))
 
-# All call sites use the model-side guard.
+# The live call sites must all carry the model-side guard.
 import re as _re
 for _f, _n in (("helpers.py", 2), ("evaluate_ffm.py", 1)):
     _src = open(_os.path.join(_SRC_DIR, _f)).read()

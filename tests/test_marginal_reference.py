@@ -1,10 +1,15 @@
-"""Test consistency between marginal reference precomputation and loss.
+"""CPU test: precompute<->backend consistency for the general marginal objective.
 
-The matched dataset should have near-zero loss, while perturbed strata should
-produce a positive loss.
+precompute_marginal_unified_reference and _marginal_unified_loss must compute
+the same statistic. The decisive check: build the reference from a dataset,
+then evaluate the loss on that same dataset. Every per-stratum mean equals its
+reference curve by construction, so the (two-sided) loss is ~0 across all
+cells (self H0, self H1, mutual). A perturbed batch must give > 0.
+
+    python src/test_marginal_reference.py    # exit 0 iff all pass
 """
 
-# Support direct execution from any working directory.
+# Make src/ importable when run from any cwd.
 import os as _os
 import sys as _sys
 _SRC_DIR = _os.path.abspath(_os.path.join(
@@ -38,7 +43,7 @@ def _ring(cx, cy, r0, half=2.5):
 
 def main():
     ok = True
-    # Use disk and ring strata with a structured auxiliary channel.
+    # 8 samples, 2 strata: A = disks (b1=0), B = rings (b1=1); channel 1 = a structured aux
     samples, strata = [], []
     for k in range(4):
         samples.append(np.stack([_disk(15 + k, 16, 7), _ring(10, 20 + k, 5)])); strata.append("A")
@@ -63,7 +68,7 @@ def main():
     loss = DifferentiableTopologicalCoherenceLoss(coords_xy, cfg, field_names=["phi", "aux"])
     loss._load_marginal_unified_reference(ref_path)
 
-    # Validate the loaded reference schema.
+    # loaded-schema sanity
     keys = set(loss._marg_ref["curves"].keys())
     want = {("self", 0, 0, 1), ("self", 0, 1, 1), ("mutual", 1, 1)}
     schema_ok = want <= keys and 1 in loss._marg_ref["lines"]
@@ -71,7 +76,8 @@ def main():
           f"{'PASS' if schema_ok else 'FAIL'}")
     ok = ok and schema_ok
 
-    # Reference data produce near-zero loss across all cells.
+    # 2. Consistency: loss on the same data gives ~0 across all cells
+    # (per-stratum means == reference).
     loss._marg_ema = {}; loss._marg_u_device = None
     total, m = loss._marginal_unified_loss(grids.clone(), strata)
     consist_ok = (float(total) < 1e-5 and int(m["marginal_cells"]) == 3)
@@ -81,7 +87,7 @@ def main():
           f"{'PASS' if consist_ok else 'FAIL'}")
     ok = ok and consist_ok
 
-    # Swapped stratum labels produce a positive loss.
+    # 3. A perturbed batch (swapped strata labels) must give > 0.
     loss._marg_ema = {}; loss._marg_u_device = None
     swapped = ["B" if s == "A" else "A" for s in strata]
     total_p, _ = loss._marginal_unified_loss(grids.clone(), swapped)

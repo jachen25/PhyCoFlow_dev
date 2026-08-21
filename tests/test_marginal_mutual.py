@@ -1,10 +1,17 @@
-"""Test the distributional cross-field mutual objective.
+"""CPU test for the general distributional mutual (joint cross-field) cell.
 
-Coverage includes reference matching, gradients to both fields, and stratum
-routing.
+Verifies the mutual cell of _marginal_unified_loss:
+  1. builds the joint field per admissible line (reference-quantile offsets) and
+     takes the mean-over-lines soft-Betti curve, a distributional joint statistic;
+  2. is genuinely cross-field: the gradient flows to both the carrier (g1) and
+     the second field (g2), which a self term could not do;
+  3. returns ~0 when the generated fields match the reference;
+  4. routes per stratum.
+
+    python src/test_marginal_mutual.py    # exit 0 iff all pass
 """
 
-# Support direct execution from any working directory.
+# Make src/ importable when run from any cwd.
 import os as _os
 import sys as _sys
 _SRC_DIR = _os.path.abspath(_os.path.join(
@@ -58,7 +65,7 @@ def main():
     gen = torch.Generator().manual_seed(0)
     lines = sample_admissible_lines(g1r[0], g2r[0], n_lines=6, generator=gen)
 
-    # Build the reference joint curve from line-family quantiles.
+    # reference joint curve (mean over lines), levels = quantiles of h_L over the line family
     hLs = [push_forward(g1r[0], g2r[0], ln) for ln in lines]
     lv = torch.quantile(torch.cat([h.flatten() for h in hLs]), QUANTS)
     ref_curve = (sum(soft_betti_curve_dim(h, lv, DIM, periodic=PER) for h in hLs)
@@ -96,14 +103,15 @@ def main():
         total.backward()
         return float(total.detach()), metrics, g.grad
 
-    # Matching generated fields produce near-zero loss.
+    # 3. Match: gen == reference gives ~0.
     l_match, m_match, _ = run(REF_C0, REF_C1, ["A", "B"])
     match_ok = l_match < 1e-6 and int(m_match["marginal_cells"]) == 1
     print(f"3. MATCH (gen==ref): total={l_match:.6f} cells={int(m_match['marginal_cells'])} "
           f"mutual_r2={m_match.get('mutual_r2'):.3f}  {'PASS' if match_ok else 'FAIL'}")
     ok = ok and match_ok
 
-    # A ring mismatch produces gradients in both channels.
+    # 1/2. Mismatch: gen carrier = ring, so mutual is penalised with gradient to
+    # both channels (cross-field).
     l_mis, m_mis, grad = run(GEN_C0, REF_C1, ["A", "B"])
     g0 = float(grad[:, 0].abs().sum()); g1 = float(grad[:, 1].abs().sum())
     cross_ok = (l_mis > 1e-6 and torch.isfinite(grad).all() and g0 > 0 and g1 > 0)
@@ -112,7 +120,9 @@ def main():
           f"{'PASS (cross-field: both fields get gradient)' if cross_ok else 'FAIL'}")
     ok = ok and cross_ok
 
-    # Unknown strata raise instead of contributing an implicit zero gradient.
+    # 4. Per-stratum routing: an unknown stratum must raise rather than be
+    # silently skipped (a skipped stratum would contribute zero gradient
+    # invisibly); the reference must be recomputed with every training stratum.
     try:
         run(GEN_C0, REF_C1, ["A", "Z"])
     except KeyError as exc:

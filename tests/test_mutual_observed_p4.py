@@ -1,10 +1,18 @@
-"""Test configuration propagation and validation for observed anchors.
+"""Config round-trip and validation tests for the observed-anchored fields.
 
-All observed-anchor fields are checked across argparse, direct-coherence, and
-topology-loss configurations.
+The 5 observed-anchored fields must survive all three config hops without a
+silent drop, and __post_init__ must fail loudly on bad values.
+  T-map   TopoDirectCoherenceConfig -> to_topo_loss_config -> TopoLossConfig
+          carries all 5 (b->a)
+  T-build build_topo_direct_coherence_config(args) carries the 5 argparse
+          dests (c->b) and defaults mutual_anchor_channels to cond_fields
+          (the observed channels)
+  T-valid __post_init__ raises on bad provider/gauge/reduction, wrong arity,
+          self-anchoring; and is inert when source='generated' (back-compat)
+Run: python test_mutual_observed_p4.py
 """
 
-# Support direct execution from any working directory.
+# Make src/ importable when run from any cwd.
 import os as _os
 import sys as _sys
 _SRC_DIR = _os.path.abspath(_os.path.join(
@@ -34,7 +42,7 @@ def raises(fn):
         return True
 
 
-# Map direct-coherence configuration to topology-loss configuration.
+# ---- T-map: b -> a (to_topo_loss_config) ----
 b = TopoDirectCoherenceConfig(
     mode="betti_self_mutual",
     mutual_anchor_source="observed", mutual_anchor_channels=[2, 3],
@@ -48,9 +56,9 @@ check("T-map gauge", a.mutual_carrier_gauge == "interface")
 check("T-map reduction", a.mutual_reduction == "curve")
 
 
-# Build direct-coherence configuration from argparse values.
+# ---- T-build: c -> b (argparse dests -> builder) + cond_fields default ----
 def _args(**over):
-    """Create a complete, overridable namespace for the builder."""
+    """A complete args namespace covering the builder's direct reads; overridable."""
     d = dict(
         _yaml_keys=set(), direct_coherence_enabled=True,
         topo_grid_h=64, topo_grid_w=64, topo_n_points=8192, topo_idx_seed=0,
@@ -70,12 +78,12 @@ def _args(**over):
         topo_reference_path=None, topo_region_relations_weight=0.0,
         topo_run_global_checks=False, topo_t_max=1.0, topo_t_min=0.0,
         topo_workers=0, topo_wrcc_weight=0.0,
-        # Observed-anchor arguments.
+        # the 5 observed-anchored dests
         topo_mutual_anchor_source="observed", topo_mutual_anchor_channels=None,
         topo_mutual_anchor_provider="vorticity", topo_mutual_carrier_gauge="interface",
         topo_mutual_reduction="match",
         cond_fields=[2, 3],
-        # Enable the observed path during validation.
+        # carrier + a nonzero mutual weight so validation exercises the observed path
         topo_bifilt_carrier_channel=0, topo_mutual_h1_weight=1.0, topo_mutual_h0_weight=0.0,
         topo_self_h0_weight=0.0, topo_self_h1_weight=0.0, topo_homology_dims=[1],
     )
@@ -90,13 +98,13 @@ check("T-build gauge dest -> b", cfg.mutual_carrier_gauge == "interface")
 check("T-build reduction dest -> b", cfg.mutual_reduction == "match")
 check("T-build anchor_channels DEFAULTS to cond_fields", list(cfg.mutual_anchor_channels) == [2, 3],
       f"got {cfg.mutual_anchor_channels}")
-# Explicit anchor channels override conditioned fields.
+# explicit channels override the cond_fields default
 cfg2 = build_topo_direct_coherence_config(_args(topo_mutual_anchor_channels=[1, 2]))
 check("T-build explicit anchor_channels override", list(cfg2.mutual_anchor_channels) == [1, 2])
-# The two mapping checks cover the full configuration path.
+# c->b carries the 5 fields (proved above); b->a proved by T-map -> composition covered.
 
 
-# Configuration validation.
+# ---- T-valid: __post_init__ ----
 def _tlc(**kw):
     base = dict(mode="betti_self_mutual", bifilt_carrier_channel=0,
                 mutual_h1_weight=1.0, mutual_h0_weight=0.0,

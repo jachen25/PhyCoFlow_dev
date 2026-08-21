@@ -1,10 +1,17 @@
-"""Test symmetry augmentation for the active-emulsion dataset.
+"""Tests for ActiveEmulsionDataset symmetry augmentation (--ae-augment).
 
-The curl-consistency check detects sign and transpose errors in rotated
-velocity components. All fixtures are synthetic.
+The transforms are meant to be exact symmetries of a periodic, isotropic
+system. A sign or transpose error in the (vx,vy) rotation would not crash;
+it would train the model on velocity fields inconsistent with their own
+vorticity channel. The central test therefore recomputes vorticity by finite
+differences from the augmented velocity and requires it to match the augmented
+vorticity channel, an invariant that holds only if the component remap is
+correct.
+
+Runs on synthetic fields only; no dataset files are read.
 """
 
-# Support direct execution from any working directory.
+# Make src/ importable when run from any cwd.
 import os as _os
 import sys as _sys
 _SRC_DIR = _os.path.abspath(_os.path.join(
@@ -21,7 +28,7 @@ from helpers import ActiveEmulsionDataset
 
 
 def _bare_ds(augment, N=16, fields=("phi", "w", "vx", "vy")):
-    """Create a dataset shell that exercises ``_augment_raw`` without I/O."""
+    """An ActiveEmulsionDataset shell exercising _augment_raw without any I/O."""
     ds = object.__new__(ActiveEmulsionDataset)
     ds.field_names = tuple(fields)
     ds.num_fields = len(fields)
@@ -34,30 +41,34 @@ def _bare_ds(augment, N=16, fields=("phi", "w", "vx", "vy")):
 
 
 def _curl(vx, vy, h):
-    """Compute periodic curl with axis 0 as y and axis 1 as x."""
+    """w = d(vy)/dx - d(vx)/dy, periodic central differences. axis0=y, axis1=x."""
     dvy_dx = (np.roll(vy, -1, axis=1) - np.roll(vy, 1, axis=1)) / (2 * h)
     dvx_dy = (np.roll(vx, -1, axis=0) - np.roll(vx, 1, axis=0)) / (2 * h)
     return dvy_dx - dvx_dy
 
 
 def _synthetic(N=16):
-    """Create smooth periodic fields with vorticity equal to discrete curl."""
+    """Smooth periodic (phi, w, vx, vy) with w exactly the discrete curl of v."""
     L = 1.0
     h = L / N
     y, x = np.meshgrid(np.arange(N) * h, np.arange(N) * h, indexing="ij")
-    # Distinct velocity means identify rotation classes without changing curl.
+    # The uniform offsets give vx/vy distinct nonzero means, so the four
+    # rotation classes are distinguishable by (sum vx, sum vy); with zero-mean
+    # fields the rotation-coverage test would be vacuous. A constant velocity
+    # has zero curl, so w stays exactly the discrete curl of v.
     vx = np.sin(2 * np.pi * y / L) + 0.5 * np.cos(4 * np.pi * x / L) + 1.0
     vy = np.cos(2 * np.pi * x / L) - 0.3 * np.sin(6 * np.pi * y / L) + 2.0
     w = _curl(vx, vy, h)
     phi = np.sin(2 * np.pi * x / L) * np.cos(2 * np.pi * y / L)
-    # A unique maximum makes cyclic shifts directly observable.
+    # sin*cos has four maxima of equal value on a symmetric grid; spike one
+    # cell so argmax is unique and the applied shift can be recovered exactly.
     phi[N // 3, N // 4] += 5.0
     arr = np.stack([phi, w, vx, vy], axis=-1)          # (N,N,4), float64
     return arr.reshape(N * N, 4), h
 
 
 def test_none_is_identity():
-    """Verify that disabled augmentation preserves the input exactly."""
+    """augment='none' must return the input unchanged so old runs stay reproducible."""
     arr, _ = _synthetic()
     ds = _bare_ds("none")
     out = ds._augment_raw(arr)
@@ -66,7 +77,7 @@ def test_none_is_identity():
 
 
 def test_translate_is_an_exact_torus_shift():
-    """Verify that translation produces an exact cyclic shift."""
+    """Every 'translate' draw must be some exact cyclic shift of the input."""
     N = 16
     arr, _ = _synthetic(N)
     ds = _bare_ds("translate", N)
@@ -87,7 +98,12 @@ def test_translate_is_an_exact_torus_shift():
 
 
 def test_rot90_preserves_vorticity():
-    """Verify discrete curl consistency after rotation."""
+    """curl(augmented v) must equal the augmented w channel.
+
+    Catches any sign error or transposition in the (vx,vy) component remap.
+    A wrong sign trains the model on velocity fields whose vorticity
+    contradicts the w channel, with no other symptom.
+    """
     N = 16
     arr, h = _synthetic(N)
     ds = _bare_ds("translate_rot90", N)
@@ -106,7 +122,7 @@ def test_rot90_preserves_vorticity():
 
 
 def test_rot90_exercises_all_four_rotations():
-    """Verify coverage of every rotation class."""
+    """Guard against k always being 0, which would make the vorticity test vacuous."""
     N = 16
     arr, _ = _synthetic(N)
     ds = _bare_ds("translate_rot90", N)
@@ -121,7 +137,7 @@ def test_rot90_exercises_all_four_rotations():
 
 
 def test_translate_never_rotates():
-    """Verify that translation does not apply a rotation."""
+    """'translate' must not rotate; the two modes must stay distinguishable."""
     N = 16
     arr, _ = _synthetic(N)
     ds = _bare_ds("translate", N)
@@ -136,7 +152,7 @@ def test_translate_never_rotates():
 
 
 def test_scalar_only_fields_still_work():
-    """Verify augmentation for phi-only datasets."""
+    """phi-only datasets (the original default) must still augment correctly."""
     N = 16
     arr, _ = _synthetic(N)
     phi = np.ascontiguousarray(arr[:, :1])
@@ -151,7 +167,8 @@ def test_scalar_only_fields_still_work():
 
 
 def test_config_surfaces_agree():
-    """Keep dataset augmentation modes aligned with CLI and YAML choices."""
+    """AUGMENT_MODES (dataset) must match the argparse choices (CLI/YAML),
+    so an option cannot exist on one surface and be dropped on the other."""
     src = (Path(_SRC_DIR) / "train_pointcloud_ffm.py").read_text()
     m = re.search(r'"--ae-augment".*?choices=\[(.*?)\]', src, re.S)
     assert m, "--ae-augment not found in the argparse surface"

@@ -1,9 +1,13 @@
-"""Test observed-anchor providers and carrier descriptors.
+"""CPU tests for the observed-anchored mutual term primitives:
+build_observed_anchor (dataset-agnostic providers) and carrier_descriptor (gauge).
 
-Coverage includes arity validation, sign invariance, and differentiability.
+Verifies: (a) finite output and correct arity errors; (b) sign-blindness of the
+magnitude providers and interface descriptor (the gauge property);
+(c) differentiability.
+Run: python test_mutual_observed_p1.py
 """
 
-# Support direct execution from any working directory.
+# Make src/ importable when run from any cwd.
 import os as _os
 import sys as _sys
 _SRC_DIR = _os.path.abspath(_os.path.join(
@@ -35,7 +39,7 @@ cases = {
 for prov, ch in cases.items():
     a = build_observed_anchor(g, prov, ch, periodic=True)
     check(f"{prov} shape+finite", a.shape == (B, H, W) and torch.isfinite(a).all())
-# Vector magnitude accepts one or more channels.
+# vector_magnitude variadic (>=1)
 check("vector_magnitude 1-ch ok", build_observed_anchor(g, "vector_magnitude", [2]).shape == (B, H, W))
 
 print("== (a') arity + range errors raise ==")
@@ -64,7 +68,7 @@ x = g[:, 0]
 di_pos = carrier_descriptor(x, "interface", periodic=True)
 di_neg = carrier_descriptor(-x, "interface", periodic=True)
 check("interface(x) == interface(-x)", torch.allclose(di_pos, di_neg, atol=1e-6))
-# The signed descriptor preserves the field sign.
+# signed is not invariant (sanity: it's the raw field)
 check("signed(x) != signed(-x)", not torch.allclose(carrier_descriptor(x, "signed"), carrier_descriptor(-x, "signed")))
 check("symmetric_min descriptor returns raw x", torch.allclose(carrier_descriptor(x, "symmetric_min"), x))
 

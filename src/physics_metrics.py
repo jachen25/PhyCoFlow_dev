@@ -1,4 +1,4 @@
-"""Domain-specific metrics for benchmark comparison.
+"""Domain-specific integrated/derived metrics for benchmark comparison.
 
 This module computes a small set of physics-meaningful scalars from a single
 snapshot's ground-truth and reconstructed fields, on top of the field-level
@@ -17,21 +17,23 @@ The dispatcher detects the dataset class and delegates to one of:
 * CarCFDDataset        -> ``car_cfd_metrics``
     Pressure-drag force F_D = integral of p * n_x dA (Pa*m^2) over the
     full body mesh, relative error, and the area-weighted relative L2 of
-    surface Cp. When info_*.pt is available (Ahmed variant), the metrics include
+    surface Cp. When info_*.pt is available (Ahmed variant) we also report
     a non-dimensional Cd_p using U_inf derived from Re.
 
 * ElasticityDataset    -> ``elasticity_metrics``
     Max von-Mises stress (value + argmax-location error) and the stress
     concentration factor K_t = sigma_max / mean(sigma|material).
 
-Reconstruction and evaluation entry points call this dispatcher when
-``--physics-metrics`` is enabled and store the results under ``"physics"``.
+The visualize_reconstruction_* functions in helpers.py and each
+``evaluate_*.py`` call this dispatcher when invoked with
+``--physics-metrics``; results are merged into the metrics JSON under a
+``"physics"`` key.
 
 Inputs are NumPy arrays of shape [N_pts, n_fields] in physical units (i.e.
 already denormalized via the dataset mean/std). ``snapshot_index`` is the
 split-local index returned by the dataset's __getitem__ semantics.
 
-A plotting layer at the bottom of this module renders the resulting
+A small plotting layer at the bottom of this module renders the resulting
 ``"physics"`` block into a single dashboard PNG (truth-vs-pred bars + a
 relative-L2 quality bar + a footer with the reference conditions). Invoke
 either via CLI::
@@ -53,7 +55,9 @@ import numpy as np
 import torch
 
 
-# Public dispatcher.
+# ---------------------------------------------------------------------------
+# Public dispatcher
+# ---------------------------------------------------------------------------
 
 def compute_physics_metrics(
     dataset,
@@ -61,7 +65,12 @@ def compute_physics_metrics(
     recon_phys: np.ndarray,
     snapshot_index: int,
 ) -> Dict[str, float]:
-    """Return flat scalar metrics for supported dataset types."""
+    """Detect dataset type and return a flat dict of scalar metrics.
+
+    Returns ``{}`` for any dataset class without a supported metric or if the
+    computation fails (so callers can unconditionally ``metrics.update(...)``
+    without breaking on unrelated datasets like turbulent combustion).
+    """
     cls_name = type(dataset).__name__
     try:
         if cls_name == "AirfoilCGridDataset":
@@ -75,7 +84,9 @@ def compute_physics_metrics(
     return {}
 
 
-# Airfoil metrics.
+# ---------------------------------------------------------------------------
+# Airfoil
+# ---------------------------------------------------------------------------
 
 def airfoil_metrics(
     dataset,
@@ -122,7 +133,7 @@ def airfoil_metrics(
     Ny, Nx = dataset.grid_shape
 
     # Per-sample physical coordinates (the dataset only exposes sample 0's
-    # coords via coords_raw, so load the per-sample C-grid here).
+    # coords via coords_raw, so we re-load the per-sample C-grid here).
     naca_dir = os.path.join(dataset.data_dir, "naca")
     CX = np.load(os.path.join(naca_dir, "NACA_Cylinder_X.npy"), mmap_mode="r")
     CY = np.load(os.path.join(naca_dir, "NACA_Cylinder_Y.npy"), mmap_mode="r")
@@ -190,7 +201,7 @@ def airfoil_metrics(
     Cd_p_, Cl_p_ = _CdCl(Fx_p, Fy_p)
 
     # Cp distribution along the body ring (q_inf cancels in relative L2 but
-    # retain it so the absolute Cp values remain physically meaningful).
+    # we keep it so the absolute Cp values are physically meaningful).
     Cp_true_body = (p_true[body_o] - p_inf) / q_inf
     Cp_pred_body = (p_pred[body_o] - p_inf) / q_inf
     cp_l2 = _rel_l2(Cp_true_body, Cp_pred_body)
@@ -217,8 +228,8 @@ def _derive_static_p(fields: np.ndarray, rho_idx: int, u_idx: int,
     p = (gamma - 1) * (rho*E - 0.5 * (rho_u^2 + rho_v^2) / rho)
 
     A few cells in shocked regions of the Geo-FNO NACA dataset yield
-    very small (or slightly negative) derived pressures. Returning the raw
-    expression keeps the integral linear in the conservative
+    very small (or even slightly negative) derived pressures; we return
+    the raw expression so the integral stays linear in the conservative
     variables and the metric remains differentiable in a model-evaluation
     sense. Clamping would bias predictions toward an artificial floor.
     """
@@ -236,7 +247,7 @@ def _load_theta(naca_dir: str, didx: int) -> float:
         return 0.0
     th = np.load(path, mmap_mode="r")
     # Some Geo-FNO releases store NACA_theta as (N, 8) shape-mode parameters
-    # rather than scalar AoA. A usable AoA can be extracted only from the
+    # rather than scalar AoA. We can only extract a usable AoA from the
     # 1-D-per-sample variant; for anything else, fall back to zero.
     if th.ndim != 1:
         return 0.0
@@ -268,7 +279,9 @@ def _surface_force_2d(bx: np.ndarray, by: np.ndarray, p: np.ndarray):
     return Fx, Fy
 
 
-# Car-CFD metrics.
+# ---------------------------------------------------------------------------
+# Car-CFD
+# ---------------------------------------------------------------------------
 
 def car_cfd_metrics(
     dataset,
@@ -300,7 +313,7 @@ def car_cfd_metrics(
     dispatcher's Cp metric, which uses the canonical (p - p_inf) / q_inf
     definition.
 
-    Ahmed-style runs also report Cd_p using U_inf from Re
+    For Ahmed-style runs we additionally report Cd_p using U_inf from Re
     and frontal area W*H from info_*.pt. ShapeNet runs lack info, so Cd_p
     is omitted there (raw F_drag and the relative error are still reported).
     """
@@ -356,10 +369,10 @@ def car_cfd_metrics(
         p_pred_face = pred_arr[nn_idx]
 
     # Pressure force = integral of p * n dA (force the fluid exerts on the body
-    # is -p * n_outward; the reported drag projection uses +n_x).
+    # is -p * n_outward; we report the drag projection magnitude using +n_x).
     # Whether the mesh normal sign is inward or outward depends on triangle
     # orientation; this only flips the sign of F_drag, leaving the relative
-    # error unchanged. The reference determines the reported magnitude.
+    # error unchanged. We report the magnitude via the reference (truth).
     F_x_true = float(np.sum(p_true_face * n_face[:, 0] * area))
     F_x_pred = float(np.sum(p_pred_face * n_face[:, 0] * area))
     A_total = float(np.sum(area))
@@ -388,7 +401,7 @@ def car_cfd_metrics(
         "wetted_area_m2": A_total,
     }
 
-    # Load info_*.pt when available to compute non-dimensional Cd_p for Ahmed meshes.
+    # Try to load info_*.pt (Ahmed only) so we can report a non-dim Cd_p.
     cd = _car_cd_from_info(dataset, snapshot_index, F_x_true, F_x_pred)
     if cd is not None:
         out.update(cd)
@@ -480,7 +493,9 @@ def _nn_assign(target_xyz: np.ndarray, source_xyz: np.ndarray) -> np.ndarray:
     return out
 
 
-# Elasticity metrics.
+# ---------------------------------------------------------------------------
+# Elasticity
+# ---------------------------------------------------------------------------
 
 def elasticity_metrics(
     dataset,
@@ -560,7 +575,9 @@ def elasticity_metrics(
     }
 
 
-# Numeric helpers.
+# ---------------------------------------------------------------------------
+# Small numeric helpers
+# ---------------------------------------------------------------------------
 
 def _rel_l2(a: np.ndarray, b: np.ndarray) -> float:
     a = np.asarray(a, dtype=np.float64).reshape(-1)
@@ -579,7 +596,12 @@ def _rel_l2_weighted(a: np.ndarray, b: np.ndarray, w: np.ndarray) -> float:
     return num / max(den, 1e-12)
 
 
-# Plotting layer. Matplotlib is imported lazily by rendering functions.
+# ---------------------------------------------------------------------------
+# Plotting layer
+#
+# matplotlib is imported lazily inside the helpers so that callers who only
+# need the compute path (evaluate_*.py per-snapshot) don't pay for it.
+# ---------------------------------------------------------------------------
 
 _QUALITY_COLORS = ("#2ca02c", "#bcbd22", "#ff7f0e", "#d62728")  # green/olive/orange/red
 _QUALITY_TAGS = ("excellent", "good", "fair", "poor")
@@ -627,8 +649,9 @@ def _quality_bar(ax, label: str, value: float,
                  xlabel: str = "relative L2 (lower is better)") -> None:
     """Horizontal bar for a lower-is-better quality scalar.
 
-    The numeric value and bucket tag use axes-fraction coordinates to avoid
-    overlapping the bar when the value is near zero.
+    The numeric value + bucket tag is rendered in a corner box (axes-fraction
+    coords) so it never overlaps the bar — important for very small values
+    where the bar end sits near x=0.
     """
     color, tag = _bucket(value, thresholds)
     xmax = max(thresholds[-1] * 1.25, value * 1.25, 0.05)
@@ -775,7 +798,13 @@ def plot_physics_metrics_from_json(eval_json_path: str,
     return str(out)
 
 
-# Snapshot-array loaders and cross-dataset helpers.
+# ---------------------------------------------------------------------------
+# Per-snapshot array loaders + cross-dataset helpers
+#
+# These renderers consume the .npz files written by
+# evaluate_ffm.py --save-arrays (one .npz per snapshot in <eval_dir>/arrays/).
+# All renderers are matplotlib-only and run on CPU.
+# ---------------------------------------------------------------------------
 
 
 def _load_snapshot_npz(npz_path):
@@ -882,7 +911,9 @@ def _draw_sensor_markers(ax, sensor_xy, edge_color="tab:green",
                marker="o", zorder=5)
 
 
-# Airfoil renderers.
+# ---------------------------------------------------------------------------
+# Airfoil renderers
+# ---------------------------------------------------------------------------
 
 
 def _airfoil_pressure(payload):
@@ -1024,8 +1055,8 @@ def plot_airfoil_cp_chordwise(payload, out_path: str):
 def plot_sensor_overlay_triptych(payload, out_path: str, field_index: int = None):
     """Truth | Recon | |Error| heatmap triptych with sensor dots overlaid.
 
-    Structured (Ny, Nx) grids are reshaped to a row-major raster and rendered
-    on their physical coordinates without resampling. Point clouds are
+    For a structured (Ny, Nx) grid we reshape onto a row-major raster and use
+    pcolormesh on the physical coords (no resampling). For point clouds we
     fall back to tripcolor. ``field_index`` defaults to the last field
     (typically pressure) when unset.
     """
@@ -1271,7 +1302,9 @@ def plot_continuity_residual_airfoil(payload, out_path: str):
     return _safe_savefig(fig, out_path)
 
 
-# Car-CFD renderers.
+# ---------------------------------------------------------------------------
+# Car CFD renderers
+# ---------------------------------------------------------------------------
 
 
 def _car_full_aligned(payload):
@@ -1532,7 +1565,9 @@ def plot_car_pressure_parity(payload, out_path: str):
     return _safe_savefig(fig, out_path)
 
 
-# Elasticity renderers.
+# ---------------------------------------------------------------------------
+# Elasticity renderers
+# ---------------------------------------------------------------------------
 
 
 def plot_elasticity_field(payload, out_path: str):
@@ -1635,7 +1670,9 @@ def plot_elasticity_concentration_map(payload, out_path: str):
     return _safe_savefig(fig, out_path)
 
 
-# Cross-dataset aggregate renderers.
+# ---------------------------------------------------------------------------
+# Cross-dataset renderers (multi-snapshot aggregates)
+# ---------------------------------------------------------------------------
 
 
 def plot_error_vs_distance_to_sensor(arrays_dir, out_path: str,
@@ -1839,7 +1876,9 @@ def plot_sweep_curves(eval_json_path, out_path: str):
     return _safe_savefig(fig, out_path)
 
 
-# Evaluation-directory rendering driver.
+# ---------------------------------------------------------------------------
+# Eval-dir batch driver: runs every applicable visualization.
+# ---------------------------------------------------------------------------
 
 
 def render_all_for_eval_dir(eval_dir, out_subdir="physics_figures"):
@@ -1948,7 +1987,8 @@ def render_all_for_eval_dir(eval_dir, out_subdir="physics_figures"):
                      field_index=list(baseline["field_names"]).index("sigma")
                      if "sigma" in baseline["field_names"] else 0))
 
-    # Render the aggregate for any available snapshot count.
+    # Always-applicable aggregate (needs more than one snapshot to be useful
+    # but works on one).
     _try("error_vs_distance_to_sensor",
          lambda: plot_error_vs_distance_to_sensor(
              str(arrays_dir),

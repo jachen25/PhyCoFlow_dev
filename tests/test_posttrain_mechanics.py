@@ -1,6 +1,6 @@
-"""Test topology post-training mechanics."""
+"""Focused tests for topology post-training mechanics."""
 
-# Support direct execution from any working directory.
+# Make src/ importable when run from any cwd.
 import os as _os
 import sys as _sys
 _SRC_DIR = _os.path.abspath(_os.path.join(
@@ -107,6 +107,38 @@ def test_periodic_gradients_and_clip_metrics():
     assert metrics["gradient_clip_fraction"] == 1.0
 
 
+def test_normalized_constrained_update_uses_data_scale_not_clip_direction():
+    model = nn.Linear(1, 1, bias=False)
+    with torch.no_grad():
+        model.weight.fill_(1.0)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    weight = model.weight.reshape(())
+    data_loss = weight.square()                    # raw grad = +2
+    topology_loss = 1000.0 * (weight - 2.0).square()  # raw grad = -2000
+    anchor_loss = 0.0 * weight
+    info = trainer._normalized_constrained_update(
+        model, optimizer, data_loss, anchor_loss, topology_loss,
+        mu_data=1.0, mu_anchor=0.0, target_ratio=0.25,
+        grad_clip_norm=None)
+    assert abs(info["raw_data_grad_norm"] - 2.0) < 1e-6
+    assert abs(info["raw_coherence_grad_norm"] - 2000.0) < 1e-3
+    assert abs(info["applied_topology_grad_norm"] - 0.5) < 1e-6
+    assert abs(info["topology_gradient_target_ratio"] - 0.25) < 1e-9
+    # Combined grad = +2 - 0.5 = +1.5, so SGD moves 1.0 -> 0.85.
+    assert abs(float(model.weight) - 0.85) < 1e-6
+    assert info["gradient_cosine"] < -0.999
+
+
+def test_stratified_selection_round_robins_across_all_strata():
+    labels = [name for name in ("a", "b", "c", "d") for _ in range(3)]
+    selected = trainer.stratified_coherence_indices(
+        labels, batch_size=8, device=torch.device("cpu")).tolist()
+    counts = {name: 0 for name in set(labels)}
+    for index in selected:
+        counts[labels[index]] += 1
+    assert set(counts.values()) == {2}
+
+
 def test_single_step_override_avoids_rollout():
     calls = {"single": 0, "rollout": 0}
 
@@ -145,6 +177,20 @@ def test_pareto_fixed_baseline_can_reject_all_candidates():
         None, epoch=10, rf_val=1.1, topology_val=1.0,
         rf_tolerance=0.02, topology_metric="topo", rf_baseline=1.0)
     assert state["selected"] is None
+
+
+def test_pareto_can_require_strict_topology_improvement_over_source():
+    state = trainer.update_pareto_selection(
+        None, epoch=10, rf_val=1.0, topology_val=5.0,
+        rf_tolerance=0.02, topology_metric="exact_h1",
+        rf_baseline=1.0, topology_baseline=5.0)
+    assert state["selected"] is None
+    state = trainer.update_pareto_selection(
+        state, epoch=20, rf_val=1.01, topology_val=4.9,
+        rf_tolerance=0.02, topology_metric="exact_h1",
+        rf_baseline=1.0, topology_baseline=5.0)
+    assert state["selected"]["epoch"] == 20
+    assert state["configured_topology_baseline"] == 5.0
 
 
 def test_deterministic_rf_validation_restores_rng():

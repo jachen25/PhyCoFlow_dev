@@ -19,6 +19,11 @@ MODES = {
         computes="Independently weighted self and mutual H0/H1 terms. Self terms match "
                  "per-field bars; mutual terms match slices of a two-field filtration. "
                  "Zero-weight cells are skipped."),
+    "comprehensive_self_mutual": dict(
+        status="recommended", homology="H0+H1+spatial",
+        computes="Paired self H0/H1 curves, region Dice and clDice connectivity, plus "
+                 "generated carrier/derived-anchor mutual H0/H1 curves and joint spatial "
+                 "co-occurrence. All terms are dimensionless and independently weighted."),
     "superlevel_overlap": dict(
         status="superseded", homology="none", old="topofix",
         computes="Soft Dice, clDice, and cross-field joint-mask Dice on thresholded fields. "
@@ -31,7 +36,8 @@ MODES = {
         status="retired", homology="cancels", old="defect",
         computes="Per-field Euler-characteristic curves, an optional H0 landscape, and a "
                  "joint Euler profile. Retired because chi=b0-b1 conflates dimensions. "
-                 "Configuration validation rejects this mode."),
+                 "Implementation removed 2026-08-13 (config raises; restore from "
+                 "backup_topo_preunify_*.tar.gz)."),
     "persistence_landscape": dict(
         status="retired", homology="H0 prominence", old="persistence",
         computes="Cross-field fibered landscapes plus optional per-field H0 landscapes. "
@@ -53,14 +59,14 @@ MODES = {
 }
 
 # ``target='marginal'`` selects per-stratum mean curves within betti_self_mutual.
-# Compatibility aliases remain valid for existing configurations and checkpoints.
+# Old mode names remain accepted for existing configurations and checkpoints.
 MODE_ALIASES = {v["old"]: k for k, v in MODES.items() if v.get("old")}
 
 _warned_modes = set()
 
 
 def canonical_mode(mode: str) -> str:
-    """Resolve a canonical mode name and warn when an alias is used."""
+    """Resolve a mode name to its canonical form, accepting (and flagging) old names."""
     m = str(mode)
     if m in MODES:
         return m
@@ -69,9 +75,9 @@ def canonical_mode(mode: str) -> str:
         if m not in _warned_modes:
             _warned_modes.add(m)
             warnings.warn(
-                f"topology mode {m!r} was renamed to {new!r}; it computes "
-                f"{MODES[new]['computes'].split('.')[0]}. The alias remains supported; "
-                "use the canonical name to silence this warning.", stacklevel=3)
+                f"topo mode {m!r} was renamed to {new!r} (it computes: "
+                f"{MODES[new]['computes'].split('.')[0]}.). The old name still works; "
+                f"update your YAML to silence this.", stacklevel=3)
         return new
     raise ValueError(
         f"unknown topo mode {mode!r}.\nValid modes (status | homology | name):\n" +
@@ -90,6 +96,7 @@ ROLLOUT_MODES = frozenset({
     "superlevel_overlap_chi_wind",
     "betti_match",
     "betti_self_mutual",
+    "comprehensive_self_mutual",
 })
 
 assert ROLLOUT_MODES <= set(MODES), (
@@ -102,7 +109,7 @@ def needs_rollout(mode: str) -> bool:
 
 
 def describe_modes() -> str:
-    """Describe each mode and its compatibility alias, if any."""
+    """Describe each mode and its legacy name, if any."""
     out = []
     for k, v in MODES.items():
         out.append(f"{k}  [{v['status']}, {v['homology']}]"
@@ -111,7 +118,7 @@ def describe_modes() -> str:
     return "\n".join(out)
 
 
-# Compatibility field aliases are rewritten with a warning.
+# Legacy field names are rewritten with a warning.
 
 FIELD_ALIASES = {
     # Weight aliases.
@@ -121,8 +128,8 @@ FIELD_ALIASES = {
     "mu_wind": "winding_weight",
     "mu_xdice": "cross_dice_weight",
     # Abbreviation aliases.
-    "xdice_weight": "cross_dice_weight",     # Cross-field abbreviation.
-    "def_weight": "missing_mass_weight",     # Deficit abbreviation.
+    "xdice_weight": "cross_dice_weight",     # x = cross-field
+    "def_weight": "missing_mass_weight",     # "def" read as Python `def`; it meant deficit
     # Shared field aliases.
     "betti_fields": "channels",   # dataclass: cfg.channels; YAML: topo_channels
     "topofix_beta": "superlevel_sharpness",
@@ -174,7 +181,7 @@ _warned_fields = set()
 
 
 def migrate_yaml_keys(cfg: dict) -> dict:
-    """Rewrite field aliases in a copy, preferring canonical keys on collisions."""
+    """Return a copy with legacy YAML keys renamed; current keys win collisions."""
     out, renamed = {}, []
     for k, v in (cfg or {}).items():
         nk = YAML_FIELD_ALIASES.get(k, k)
@@ -190,6 +197,6 @@ def migrate_yaml_keys(cfg: dict) -> dict:
         key = tuple(sorted(renamed))
         if key not in _warned_fields:
             _warned_fields.add(key)
-            warnings.warn("retired config keys were auto-renamed; update the YAML:\n    "
+            warnings.warn("retired config keys were auto-renamed (update your YAML):\n    "
                           + "\n    ".join(renamed), stacklevel=2)
     return out

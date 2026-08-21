@@ -11,7 +11,7 @@ import torch
 from . import betti_matching_ref as _bm
 
 
-# Vectorized cubical-map construction for the V filtration.
+# Fast vectorized replacement for CubicalPersistence.set_CubeMap (construction V).
 def _fast_set_CubeMap(self):
     if hasattr(self.PixelMap, "detach"):
         PM = self.PixelMap.detach().cpu().numpy().astype(np.float64)
@@ -30,7 +30,7 @@ def _fast_set_CubeMap(self):
         raise NotImplementedError("fast_set_CubeMap implements construction 'V' only")
     if self.filtration != "superlevel":
         raise NotImplementedError("fast_set_CubeMap implements filtration 'superlevel' only")
-    order = np.argsort(PM, axis=None, kind="stable")   # Ascending filtration values.
+    order = np.argsort(PM, axis=None, kind="stable")   # ascending original value
     Pflat = PM.reshape(-1)
     for idx in order:
         i = idx // n; j = idx % n; val = Pflat[idx]
@@ -55,15 +55,26 @@ def _fast_set_CubeMap(self):
         counter -= 1
 
 
-_bm.CubicalPersistence.set_CubeMap = _fast_set_CubeMap   # Install the vectorized constructor.
+_bm.CubicalPersistence.set_CubeMap = _fast_set_CubeMap   # monkeypatch (fast, exact)
 
 
 # Differentiable single-field loss.
 def _cell_pixels(coord):
-    """Return pixels generating a cell in the doubled cubical lattice.
+    """Generating pixels of a cell in the doubled (2H, 2W) cubical lattice.
 
-    Coordinate parity identifies vertices, vertical edges, horizontal edges,
-    and square cells with one, two, two, and four generating pixels.
+    Cell type is set by the coordinate parity, matching the reference's own
+    ``index_to_dim`` (betti_matching_ref.py:352-360):
+      (even, even) -> vertex   (dim 0), 1 pixel
+      (odd,  even) -> vertical edge   (dim 1), 2 pixels
+      (even, odd)  -> horizontal edge (dim 1), 2 pixels
+      (odd,  odd)  -> square / 2-cell (dim 2), 4 pixels
+
+    The square branch is required for correctness: under a super-level
+    V-construction a cell's value is the min over its generating pixels, and in
+    2D every H1 (loop) class dies at a square. Omitting it routes squares into
+    the vertical-edge branch, gathering 2 of 4 corners (both from the left
+    column), so every H1 death value is biased high and its gradient lands on
+    the wrong pixels.
     """
     r, c = coord
     if r % 2 == 0 and c % 2 == 0:                       # vertex (dim 0)
@@ -77,7 +88,12 @@ def _cell_pixels(coord):
 
 
 def _val(field, coord):
-    """Return the differentiable minimum over a cell's generating pixels."""
+    """Live (differentiable) super-level value of a cell = min over its pixels.
+
+    Mirrors what _fast_set_CubeMap writes (first touch of an ascending argsort =
+    min over the cell's generating pixels). The min routes the subgradient to the
+    single argmin pixel, which is the one that actually controls the cell's value.
+    """
     H, W = field.shape
     vals = [field[p[0] % H, p[1] % W] for p in _cell_pixels(coord)]
     return vals[0] if len(vals) == 1 else torch.stack(vals).min()
@@ -85,10 +101,14 @@ def _val(field, coord):
 
 def betti_loss_field(pred, target, dims=(0, 1), periodic_pad=0, normalize="gt_bars",
                      return_n_gt=False):
-    """Return super-level Betti-matching loss between two ``[H,W]`` fields.
+    """Differentiable Betti-matching loss between two 2D torch fields.
 
-    ``normalize='gt_bars'`` divides the raw bar loss by the target's
-    positive-persistence bar count.
+    pred: [H,W] differentiable; target: [H,W] constant. Super-level filtration.
+
+    normalize:
+      "none"     -- raw sum over bars (reference convention).
+      "gt_bars"  -- divide by the target's positive-persistence bar count
+                    ("bar error per GT feature").
     """
     if periodic_pad > 0:
         p = periodic_pad
@@ -135,10 +155,11 @@ def betti_loss_field(pred, target, dims=(0, 1), periodic_pad=0, normalize="gt_ba
 
 def betti_matching_loss(sal_pred, sal_ref, dims=(0, 1), periodic_pad=0,
                         normalize="gt_bars"):
-    """Return batched Betti-matching loss for ``[B,F,H,W]`` saliency grids.
+    """Batched Betti-matching loss over saliency grids.
 
-    Persistence pairings run on CPU while differentiable values remain on the
-    prediction device.
+    sal_pred, sal_ref: [B, F, H, W] (F = betti fields). Returns (scalar, n_terms).
+    Loops samples x fields on CPU (persistence is CPU); the differentiable value
+    gather runs on the pred's device.
     """
     B, F = sal_pred.shape[0], sal_pred.shape[1]
     total = sal_pred.new_zeros(())

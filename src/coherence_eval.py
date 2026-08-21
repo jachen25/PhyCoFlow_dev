@@ -564,7 +564,7 @@ def aggregate(records: List[dict], key: str = "d_b1",
 
 @contextmanager
 def _seeded_torch_rng(seed: int, device):
-    """Use deterministic CPU and device RNG streams, then restore caller state."""
+    """Use repeatable CPU/device RNG streams and restore caller state."""
     dev = torch.device(device)
     cuda_devices = []
     if dev.type == "cuda":
@@ -584,18 +584,272 @@ def coherence_on_batch(x_pred: torch.Tensor, x_ref: torch.Tensor,
     loss, comps = topo_loss_fn(x_pred, x_ref, mean=mean, std=std, regimes=regimes)
     out = {"val_topo_loss": float(loss.detach().cpu())}
     for k, v in comps.items():
-        if not torch.is_tensor(v):
-            try:
-                out[f"val_topo_{k}"] = float(v)
-            except (TypeError, ValueError):
-                pass
+        if k == "component_tensors":
+            continue
+        # The direct wrapper exposes a live component tensor under ``name`` and
+        # its detached logging value under ``metric/name``.  Normalize both to
+        # the public validation key; the detached metric arrives last and wins.
+        name = str(k)[len("metric/"):] if str(k).startswith("metric/") else str(k)
+        try:
+            scalar = (float(v.detach().cpu()) if torch.is_tensor(v) and v.ndim == 0
+                      else float(v) if not torch.is_tensor(v) else None)
+        except (TypeError, ValueError):
+            scalar = None
+        if scalar is not None:
+            out[f"val_topo_{name}"] = scalar
     return out
+
+
+@torch.no_grad()
+def exact_betti_validation_on_batch(x_pred: torch.Tensor, x_ref: torch.Tensor,
+                                    topo_loss_fn, args) -> Dict[str, float]:
+    """Measure exact physical H0/H1 curve error on the topology grid."""
+    inner = getattr(topo_loss_fn, "_loss", None)
+    if inner is None or not hasattr(inner, "_rasterize_physical_prediction"):
+        raise TypeError("exact Betti validation requires DirectTopologicalCoherenceLoss")
+    pred_grid = inner._rasterize_physical_prediction(x_pred).detach().cpu().numpy()
+    ref_grid = inner._rasterize_reference(
+        x_ref, physical=True).detach().cpu().numpy()
+    channels = getattr(args, "topo_channels", None)
+    channel = int(channels[0]) if channels else int(getattr(
+        args, "topo_bifilt_carrier_channel", 0))
+    if channel < 0 or channel >= pred_grid.shape[1]:
+        raise IndexError(
+            f"exact Betti validation channel {channel} outside C={pred_grid.shape[1]}")
+    levels = _checked_levels(
+        getattr(args, "topo_superlevel_physical_levels", None)
+        or getattr(args, "topo_marginal_physical_levels", DEFAULT_PHYSICAL_LEVELS)
+        or DEFAULT_PHYSICAL_LEVELS)
+    signs = _active_signs(str(getattr(args, "topo_filtration_direction", "both")))
+    periodic = bool(getattr(getattr(inner, "cfg", None), "periodic_grid", True))
+    h0_delta, h1_delta, h0_reference, h1_reference = [], [], [], []
+    for sample in range(pred_grid.shape[0]):
+        p = pred_grid[sample, channel]
+        r = ref_grid[sample, channel]
+        for sign in signs:
+            multiplier = 1.0 if sign == "p" else -1.0
+            pc = pm.betti_curve(multiplier * p, levels, periodic=periodic)
+            rc = pm.betti_curve(multiplier * r, levels, periodic=periodic)
+            h0_delta.extend((pc["b0"] - rc["b0"]).astype(float).tolist())
+            h1_delta.extend((pc["b1"] - rc["b1"]).astype(float).tolist())
+            h0_reference.extend(rc["b0"].astype(float).tolist())
+            h1_reference.extend(rc["b1"].astype(float).tolist())
+    h0 = np.asarray(h0_delta, dtype=float)
+    h1 = np.asarray(h1_delta, dtype=float)
+    h0_ref = np.asarray(h0_reference, dtype=float)
+    h1_ref = np.asarray(h1_reference, dtype=float)
+    return {
+        "val_exact_h0_curve_l1": float(np.abs(h0).mean()),
+        "val_exact_h0_curve_bias": float(h0.mean()),
+        "val_exact_h0_curve_nmae": float(
+            np.abs(h0).sum() / np.maximum(np.abs(h0_ref), 1.0).sum()),
+        "val_exact_h1_curve_l1": float(np.abs(h1).mean()),
+        "val_exact_h1_curve_bias": float(h1.mean()),
+        "val_exact_h1_curve_nmae": float(
+            np.abs(h1).sum() / np.maximum(np.abs(h1_ref), 1.0).sum()),
+    }
+
+
+def exact_mutual_validation_on_batch(
+        x_pred: torch.Tensor, x_ref: torch.Tensor, topo_loss_fn, args,
+        ) -> Dict[str, float]:
+    """Exact generated phi-vorticity H0/H1 and joint spatial error."""
+    from topo_coherence_training.mph_fibered import (
+        build_observed_anchor, carrier_descriptor, push_forward,
+        sample_admissible_lines, standardize_by_reference)
+    from topo_coherence_training.topo_loss import gaussian_blur
+
+    inner = getattr(topo_loss_fn, "_loss", None)
+    if inner is None or not hasattr(inner, "_rasterize_physical_prediction"):
+        raise TypeError("exact mutual validation requires DirectTopologicalCoherenceLoss")
+    cfg = inner.cfg
+    normalized_pred = inner.rasterizer.to_grid(x_pred)
+    normalized_ref = inner._rasterize_reference(x_ref)
+    if float(cfg.presmooth_sigma) > 0.0:
+        normalized_pred = gaussian_blur(
+            normalized_pred, float(cfg.presmooth_sigma),
+            periodic=bool(cfg.periodic_grid))
+    physical_pred = inner._rasterize_physical_prediction(x_pred)
+    physical_ref = inner._rasterize_reference(x_ref, physical=True)
+    carrier_channel = int(cfg.bifilt_carrier_channel)
+    anchor_channels = [int(channel) for channel in cfg.mutual_anchor_channels]
+    carrier_pred = carrier_descriptor(
+        normalized_pred[:, carrier_channel], str(cfg.mutual_carrier_gauge),
+        periodic=bool(cfg.periodic_grid))
+    carrier_ref = carrier_descriptor(
+        normalized_ref[:, carrier_channel], str(cfg.mutual_carrier_gauge),
+        periodic=bool(cfg.periodic_grid)).detach()
+    anchor_pred = build_observed_anchor(
+        physical_pred, str(cfg.mutual_anchor_provider), anchor_channels,
+        periodic=bool(cfg.periodic_grid))
+    anchor_ref = build_observed_anchor(
+        physical_ref, str(cfg.mutual_anchor_provider), anchor_channels,
+        periodic=bool(cfg.periodic_grid)).detach()
+    valid = ((carrier_ref.flatten(1).std(dim=1) > 1e-7)
+             & (anchor_ref.flatten(1).std(dim=1) > 1e-7))
+    if not bool(valid.any()):
+        raise RuntimeError("exact mutual validation has no nonconstant valid samples")
+    carrier_pred, carrier_ref = carrier_pred[valid], carrier_ref[valid]
+    anchor_pred, anchor_ref = anchor_pred[valid], anchor_ref[valid]
+
+    quantiles = torch.as_tensor(
+        tuple(float(value) for value in cfg.marginal_quantiles),
+        dtype=carrier_pred.dtype, device=carrier_pred.device)
+    signs = _active_signs(str(cfg.filtration_direction))
+    error = {0: 0.0, 1: 0.0}
+    denominator = {0: 0.0, 1: 0.0}
+    for batch_index in range(carrier_pred.shape[0]):
+        for sign_name in signs:
+            sign = 1.0 if sign_name == "p" else -1.0
+            cp = standardize_by_reference(
+                sign * carrier_pred[batch_index], sign * carrier_ref[batch_index])
+            ct = standardize_by_reference(
+                sign * carrier_ref[batch_index], sign * carrier_ref[batch_index]).detach()
+            ap = standardize_by_reference(
+                anchor_pred[batch_index], anchor_ref[batch_index])
+            at = standardize_by_reference(
+                anchor_ref[batch_index], anchor_ref[batch_index]).detach()
+            lines = sample_admissible_lines(
+                ct.flatten(), at.flatten(), int(cfg.bifilt_n_lines),
+                theta_min_deg=float(cfg.bifilt_theta_min_deg),
+                q_lo=float(cfg.bifilt_offset_q_lo),
+                q_hi=float(cfg.bifilt_offset_q_hi), sampling="fan")
+            for line in lines:
+                pred_push = push_forward(cp, ap, line).detach().cpu().numpy()
+                ref_push = push_forward(ct, at, line).detach().cpu().numpy()
+                levels = np.quantile(ref_push.reshape(-1), quantiles.cpu().numpy())
+                pred_curve = pm.betti_curve(
+                    pred_push, levels, periodic=bool(cfg.periodic_grid))
+                ref_curve = pm.betti_curve(
+                    ref_push, levels, periodic=bool(cfg.periodic_grid))
+                for dim, key in ((0, "b0"), (1, "b1")):
+                    delta = np.asarray(pred_curve[key], dtype=float) - np.asarray(
+                        ref_curve[key], dtype=float)
+                    error[dim] += float(np.abs(delta).sum())
+                    denominator[dim] += float(
+                        np.maximum(np.abs(ref_curve[key]), 1.0).sum())
+    spatial = _generated_output_mutual_spatial_error(
+        carrier_pred, anchor_pred, carrier_ref, anchor_ref,
+        quantiles=tuple(float(value) for value in cfg.marginal_quantiles),
+        filtration_direction=str(cfg.filtration_direction),
+        beta=float(cfg.marginal_beta))
+    return {
+        "val_exact_mutual_h0_nmae": error[0] / max(denominator[0], 1e-12),
+        "val_exact_mutual_h1_nmae": error[1] / max(denominator[1], 1e-12),
+        "val_exact_mutual_spatial_error": float(spatial.detach().cpu()),
+        "val_exact_mutual_valid_fraction": float(valid.float().mean()),
+    }
+
+
+def comprehensive_topology_score(result: Dict[str, float], args) -> float:
+    """Return the validation composite aligned with the trained objective.
+
+    Each active training surface must have a finite held-out counterpart.  The
+    separate Pareto guards remain responsible for preventing a good aggregate
+    from concealing a regression in any one self or mutual topology surface.
+    """
+    weighted_metrics = (
+        ("val_exact_h0_curve_nmae", "topo_self_h0_weight"),
+        ("val_exact_h1_curve_nmae", "topo_self_h1_weight"),
+        ("val_topo_self_persistence_h0", "topo_self_persistence_h0_weight"),
+        ("val_topo_self_persistence_h1", "topo_self_persistence_h1_weight"),
+        ("val_topo_dice", "topo_dice_weight"),
+        ("val_topo_cldice", "topo_cldice_weight"),
+        ("val_topo_xdice", "topo_cross_dice_weight"),
+        ("val_exact_mutual_h0_nmae", "topo_output_mutual_h0_weight"),
+        ("val_exact_mutual_h1_nmae", "topo_output_mutual_h1_weight"),
+        ("val_topo_output_mutual_persistence_h0",
+         "topo_output_mutual_persistence_h0_weight"),
+        ("val_topo_output_mutual_persistence_h1",
+         "topo_output_mutual_persistence_h1_weight"),
+        ("val_exact_mutual_spatial_error", "topo_output_mutual_spatial_weight"),
+    )
+    active = [
+        (metric, float(getattr(args, weight_name, 0.0)))
+        for metric, weight_name in weighted_metrics
+        if float(getattr(args, weight_name, 0.0)) > 0.0
+    ]
+    if not active:
+        raise RuntimeError("comprehensive topology validation has no active metrics")
+    missing = [metric for metric, _weight in active if metric not in result]
+    if missing:
+        raise RuntimeError(
+            f"incomplete comprehensive topology validation; missing {missing}")
+    invalid = [
+        metric for metric, _weight in active
+        if not np.isfinite(float(result[metric]))
+    ]
+    if invalid:
+        raise RuntimeError(
+            f"non-finite comprehensive topology validation metrics: {invalid}")
+    denominator = sum(weight for _metric, weight in active)
+    return float(sum(
+        weight * float(result[metric]) for metric, weight in active
+    ) / denominator)
+
+
+def _dataset_stratum_labels(dataset, key: str) -> Optional[List[str]]:
+    """Read topology strata without loading field tensors."""
+    from torch.utils.data import Subset
+
+    if isinstance(dataset, Subset):
+        base = _dataset_stratum_labels(dataset.dataset, key)
+        return None if base is None else [base[int(i)] for i in dataset.indices]
+    metadata = getattr(dataset, "_meta", None)
+    if metadata is None or len(metadata) != len(dataset):
+        return None
+    key_fn = getattr(type(dataset), "stratum_keys", None)
+    labels = []
+    for item in metadata:
+        try:
+            value = key_fn(item)[key] if callable(key_fn) else item[key]
+        except (KeyError, TypeError):
+            return None
+        labels.append(str(value))
+    return labels
+
+
+def _stratified_validation_loader(loader, key: str, batch_size: int,
+                                  n_batches: int, seed: int):
+    """Build a fixed cohort whose every batch covers every validation stratum."""
+    from torch.utils.data import DataLoader
+
+    dataset = loader.dataset
+    labels = _dataset_stratum_labels(dataset, key)
+    if labels is None:
+        raise RuntimeError(
+            f"topo_stratified_val_batches=true but validation metadata cannot emit {key!r}")
+    groups: Dict[str, List[int]] = defaultdict(list)
+    for index, label in enumerate(labels):
+        groups[label].append(index)
+    if int(batch_size) < len(groups):
+        raise ValueError(
+            f"coherence_batch_size={batch_size} cannot cover all {len(groups)} "
+            f"validation strata")
+    generator = torch.Generator().manual_seed(int(seed))
+    names = sorted(groups)
+    shuffled = {}
+    for name in names:
+        order = torch.randperm(len(groups[name]), generator=generator).tolist()
+        shuffled[name] = [groups[name][i] for i in order]
+    batches = []
+    for batch_index in range(int(n_batches)):
+        batch = [shuffled[name][batch_index % len(shuffled[name])] for name in names]
+        fill = int(batch_size) - len(batch)
+        if fill > 0:
+            batch.extend(torch.randint(
+                len(dataset), (fill,), generator=generator).tolist())
+        order = torch.randperm(len(batch), generator=generator).tolist()
+        batches.append([batch[i] for i in order])
+    return DataLoader(
+        dataset, batch_sampler=batches, num_workers=0,
+        collate_fn=getattr(loader, "collate_fn", None), pin_memory=False)
 
 
 @torch.no_grad()
 def val_coherence(model, loader, topo_loss_fn, topo_idx_t, device, args,
                   mean=None, std=None, max_batches: int = 4) -> Dict[str, float]:
-    """Evaluate the training topology objective on a bounded validation subset."""
+    """Evaluate the training topology objective on a bounded val subset."""
     import random
     from direct_coherence_loss import clean_estimate, clean_estimate_rollout
     from helpers_baseline import (
@@ -647,9 +901,26 @@ def val_coherence(model, loader, topo_loss_fn, topo_idx_t, device, args,
     model.eval()
     _prev_freeze = getattr(topo_loss_fn, "_marg_freeze", False)
     topo_loss_fn._marg_freeze = True
+    # Comprehensive barcode evaluation uses a rotating CPU-bounded subset.
+    # Reset its phase for every validation invocation so the frozen source and
+    # every candidate are measured on identical samples. Restore the training
+    # phase afterward so validation cannot perturb the train rotation.
+    _inner_topology = getattr(topo_loss_fn, "_loss", None)
+    _prev_comprehensive_calls = getattr(
+        _inner_topology, "_comprehensive_calls", None)
+    if (_prev_comprehensive_calls is not None
+            and str(getattr(args, "topo_mode", "")) == "comprehensive_self_mutual"):
+        _inner_topology._comprehensive_calls = 0
     acc: Dict[str, List[float]] = defaultdict(list)
+    eval_loader = loader
+    if bool(getattr(args, "topo_stratified_val_batches", False)):
+        _key = str(getattr(args, "topo_marginal_stratify_key", "regime"))
+        eval_loader = _stratified_validation_loader(
+            loader, _key,
+            int(getattr(args, "coherence_batch_size", 2)),
+            int(max_batches), val_seed)
     try:
-      for bi, batch in enumerate(loader):
+      for bi, batch in enumerate(eval_loader):
         if bi >= int(max_batches):
             break
         coords_full = batch["coords"].to(device)
@@ -689,10 +960,13 @@ def val_coherence(model, loader, topo_loss_fn, topo_idx_t, device, args,
                     "'params'; the held-out coherence number would not match training.")
             _params = _p.to(device)[sel]
         if use_rollout:
+            validation_steps = int(getattr(
+                args, "val_coherence_rollout_steps", 0) or
+                getattr(args, "epi_rollout_steps", 2))
             x_hat1 = clean_estimate_rollout(
                 model, fields_query, coords_query, obs_coords[sel], obs_values[sel],
                 obs_mask[sel], obs_field_ids[sel], obs_indices=obs_sel,
-                n_steps=int(getattr(args, "epi_rollout_steps", 2)),
+                n_steps=validation_steps,
                 source_seed=12345 + bi,
                 ode_solver=str(getattr(args, "ode_solver", "euler")),
                 obs_consistency_mode=str(getattr(
@@ -719,15 +993,29 @@ def val_coherence(model, loader, topo_loss_fn, topo_idx_t, device, args,
         for k, v in coherence_on_batch(x_hat1, fields_topo, topo_loss_fn,
                                        mean=mean, std=std, regimes=regimes_sel).items():
             acc[k].append(v)
+        if bool(getattr(args, "topo_exact_betti_validation", False)):
+            for k, v in exact_betti_validation_on_batch(
+                    x_hat1, fields_topo, topo_loss_fn, args).items():
+                acc[k].append(v)
+        if bool(getattr(args, "topo_exact_mutual_validation", False)):
+            for k, v in exact_mutual_validation_on_batch(
+                    x_hat1, fields_topo, topo_loss_fn, args).items():
+                acc[k].append(v)
     finally:
         topo_loss_fn._marg_freeze = _prev_freeze
+        if _prev_comprehensive_calls is not None:
+            _inner_topology._comprehensive_calls = _prev_comprehensive_calls
         model.train(was_training)
         torch.set_rng_state(cpu_rng)
         if cuda_rng is not None:
             torch.cuda.set_rng_state_all(cuda_rng)
         np.random.set_state(numpy_rng)
         random.setstate(python_rng)
-    return {k: float(np.mean(v)) for k, v in acc.items() if v}
+    result = {k: float(np.mean(v)) for k, v in acc.items() if v}
+    if str(getattr(args, "topo_mode", "")) == "comprehensive_self_mutual":
+        result["val_comprehensive_topology_score"] = (
+            comprehensive_topology_score(result, args))
+    return result
 
 
 @torch.no_grad()

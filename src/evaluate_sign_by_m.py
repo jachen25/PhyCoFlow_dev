@@ -1,6 +1,8 @@
 """Evaluate phase-sign recovery by ``m`` using shared velocity sensors.
 
-Metrics are computed per draw, with uncertainty clustered by parameter cell.
+The velocity observation is invariant to ``phi -> -phi``. Known ``m`` can select a
+branch when nonzero; the symmetric ``m=0`` posterior remains sign-ambiguous. Metrics
+are computed per draw and uncertainty is clustered by parameter cell.
 """
 from __future__ import annotations
 

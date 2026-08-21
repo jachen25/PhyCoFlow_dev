@@ -1,13 +1,35 @@
-"""Differentiable H0 persistence and fibered two-parameter landscapes.
+"""
+Differentiable H0 sublevel-set persistence + fibered (2-parameter) landscapes.
 
-H0 pairings are computed by a union-find sweep over detached filtration
-values. Birth and death values are then gathered from the live tensor, giving
-the standard piecewise-differentiable topology-layer construction.
+A multi-parameter-persistence summary that backprops into the generated field,
+usable as a training regularizer and a sampling-time guidance signal.
 
-Two-parameter summaries slice a bifiltration along weighted lines, reduce each
-slice to ``t = max(w * a, (1 - w) * b)``, and stack the resulting persistence
-landscapes. High saliency is negated before sublevel persistence so salient
-regions enter the filtration first.
+Key idea: the values are differentiable, the combinatorics are not
+------------------------------------------------------------------
+0-dim sublevel persistence of a function on a graph is computed with a
+union-find sweep over vertices in increasing filtration order. The output of
+that sweep is, for every topological feature, a pair of *critical vertices*:
+    birth vertex  (a local minimum where a component is born)
+    death vertex  (the saddle where it merges into an older component)
+Which vertices are critical is a piecewise-constant function of the field, so
+the pairing is computed in numpy on detached values, and the birth/death values
+are then *gathered* from the live torch tensor. Gradients flow only through the
+critical vertices -- the Topology-Layer / torch-tda construction. The result is
+differentiable almost everywhere w.r.t. the field.
+
+Multi-parameter (joint) topology via fibered barcodes
+-----------------------------------------------------
+A true 2-parameter persistence module has no complete barcode, hence the
+fibered-barcode route: slice the bifiltration of two saliencies (a, b) along a
+family of lines (weights w_l), reduce each slice to an ordinary 1-parameter
+filtration t_n = max(w_l * a_n, (1-w_l) * b_n), and stack the per-slice
+persistence landscapes. Each slice is differentiable by the above, so the whole
+stack is. This is the differentiable multiparameter-persistence-landscape
+construction (Vipond 2020; Scoccola et al. 2024).
+
+Convention: high-saliency structures are the features of interest, so sublevel
+persistence runs on the negated saliency (`-s`); a salient region appears early
+in the filtration. The helpers below apply the negation.
 """
 
 from __future__ import annotations
@@ -23,14 +45,20 @@ except Exception:  # pragma: no cover
     _HAVE_TORCH = False
 
 
-# Graph construction.
+# -----------------------------------------------------------------------------
+# Graph construction
+# -----------------------------------------------------------------------------
 
 def grid_edges(h: int, w: int, connectivity: int = 1, periodic: bool = False) -> np.ndarray:
     """Edge list [E, 2] of the H x W pixel grid graph (row-major vertex ids).
 
     connectivity=1 -> 4-neighbour (faces); 2 -> 8-neighbour (incl. diagonals).
-    periodic=True adds torus wrap edges, including diagonal wraps when
-    connectivity>=2. The flag must match the topology of the physical domain.
+    periodic=True adds torus wrap edges (last row<->first row, last col<->first
+    col, and the diagonal wraps when connectivity>=2). Required for the active-
+    emulsion domain: the solver is pseudo-spectral (periodic BCs), so without wrap
+    edges a boundary-straddling droplet splits into two components -> wrong H0
+    count / wrong essential bar / biased SFTD. All downstream persistence/count
+    terms inherit this graph, so periodic must match the data's topology.
     """
     idx = np.arange(h * w).reshape(h, w)
     edges: List[np.ndarray] = []
@@ -56,10 +84,20 @@ def grid_edges(h: int, w: int, connectivity: int = 1, periodic: bool = False) ->
 
 def soft_betti0(births: "torch.Tensor", deaths: "torch.Tensor", kappa: float,
                 tau0: float = 0.0, essential: bool = True) -> "torch.Tensor":
-    """Compute a differentiable persistence-thresholded Betti-0 count.
+    """Differentiable soft Betti-0 (component) count of an H0 diagram.
 
-    Each finite bar contributes ``sigmoid(kappa * (persistence - tau0))``;
-    ``essential`` adds the essential component.
+    ``beta0_soft = [1 if essential] + sum_j sigmoid(kappa * (persistence_j - tau0))``
+    with ``persistence_j = death_j - birth_j``.
+
+    ``tau0`` is a persistence floor that separates prominent components from the
+    many near-zero "ripple" bars (one per local maximum of a smoothed field): a
+    bar contributes ~1 only when its persistence clears ``tau0`` by ~1/kappa,
+    else ~0. Without a floor the hundreds of ripple bars each contribute ~0.5
+    and swamp the count, making it insensitive to the actual component number.
+    Differentiable through the gathered bar values -> raising a near-floor
+    blob's prominence increases the count (a creation-capable gradient).
+    Amplitude-robustness comes from a standardized saliency (persistence in
+    z-units), not from this function.
     """
     _require_torch()
     base = births.new_ones(()) if essential else births.new_zeros(())
@@ -77,7 +115,9 @@ def _adjacency(n: int, edges: np.ndarray) -> List[List[int]]:
     return adj
 
 
-# H0 sublevel persistence pairing on detached NumPy values.
+# -----------------------------------------------------------------------------
+# Combinatorial core: H0 sublevel persistence pairing (numpy, detached)
+# -----------------------------------------------------------------------------
 
 def h0_sublevel_pairs(
     values: np.ndarray,
@@ -122,7 +162,8 @@ def h0_sublevel_pairs(
             if ru == rv:
                 continue
             bu, bv = comp_birth[ru], comp_birth[rv]
-            # The later-born component dies at the current level; index breaks ties.
+            # The "younger" component (the one with the later/larger birth
+            # value) dies at the current level t[v]. Tie-break by index.
             if (values[bu], bu) >= (values[bv], bv):
                 younger_birth, younger_root, older_root, older_birth = bu, ru, rv, bv
             else:
@@ -135,7 +176,9 @@ def h0_sublevel_pairs(
     return np.asarray(births, dtype=np.int64), np.asarray(deaths, dtype=np.int64), essential
 
 
-# Differentiable diagram and landscape operations.
+# -----------------------------------------------------------------------------
+# Differentiable diagram + landscape (torch)
+# -----------------------------------------------------------------------------
 
 def _require_torch() -> None:
     if not _HAVE_TORCH:
@@ -203,7 +246,9 @@ def persistence_landscape(
     return top
 
 
-# Fibered two-parameter landscapes and the Phi_mph loss.
+# -----------------------------------------------------------------------------
+# Fibered (2-parameter) landscapes + the Phi_mph coherence loss
+# -----------------------------------------------------------------------------
 
 def _slice_filtration(a_neg: "torch.Tensor", b_neg: "torch.Tensor", w: float) -> "torch.Tensor":
     """One fibered slice: ``t = max(w * a_neg, (1-w) * b_neg)`` (elementwise).
@@ -235,9 +280,11 @@ def fibered_landscapes(
 
 
 def _saliency_neg(field: "torch.Tensor", mode: str = "zscore_abs", eps: float = 1e-8) -> "torch.Tensor":
-    """Return differentiable saliency negated for sublevel persistence.
+    """Differentiable saliency, negated for sublevel persistence (high s -> early).
 
-    ``pos`` and ``neg`` retain one standardized tail; ``abs`` folds both tails.
+    'pos'/'neg' are one-sided (sign-aware) saliencies for fields whose sign is
+    physically meaningful (e.g. z-scored T/CH4/CO): 'pos' keeps only the z>0 tail,
+    'neg' only the z<0 tail, instead of folding both tails like 'abs'.
     """
     if mode == "raw":
         s = field

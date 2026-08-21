@@ -1,11 +1,32 @@
-"""Regression tests for N12 topology post-training changes.
+"""Regression tests for the N12 topological post-training review fixes.
 
-Coverage includes physical anchors, rollout behavior, marginal freezing,
-checkpoint state, parameter forwarding, configuration inheritance, and
-dataset stratification. Fixtures are synthetic and CPU-only.
+One test per finding (numbering follows TOPOLOGICAL_POSTTRAIN_REVIEW_N12.md):
+
+  #2  observed 'vorticity' anchor is built from denormalized physical velocity
+  #4  rollout runs the eval-mode network, honors ode_solver, rejects
+      unimplementable obs-consistency, and keeps gradient-checkpoint recomputes
+      consistent with the eval-mode forward even when backward() runs with the
+      model back in train mode
+  #5  fixed-weight warmup mechanics; the retired lambda probe/adapt controllers
+      are pinned absent (replaced by the constrained primal-dual mode, see
+      test_constrained_topo.py)
+  #6  _marg_freeze set on the Direct wrapper reaches the inner loss; frozen
+      _match_marginal does not mutate the training EMA
+  #7  RNG snapshot/restore round-trips; validate_pretrained_stats guards
+      checkpoint-vs-loader stats; the staged marginal EMA survives the
+      reference loader's reset; resume prefers last.pt
+  #8  the deployed gate uses the params-forwarding helpers path
+  #9  SOURCE_BASE_CONFIG_KEYS carries the AE dataset-identity keys, and every
+      key in the four N12 post-train YAMLs is a recognized argparse dest
+  (m) ActiveEmulsionDataset.stratum_keys emits 'regime'/'m_bin'/'regime_m';
+      missing stratify keys fail loud
+
+Synthetic tensors only: no dataset files are read, no GPU is needed, and the
+heavyweight topo-loss construction is bypassed via the object.__new__ shell
+pattern from test_ae_augment.py.
 """
 
-# Support direct execution from any working directory.
+# Make src/ importable when run from any cwd.
 import os as _os
 import sys as _sys
 _SRC_DIR = _os.path.abspath(_os.path.join(
@@ -38,7 +59,7 @@ def check(name, cond, detail=""):
         print(f"  FAIL  {name}  {detail}")
 
 
-# Marginal-freeze propagation and frozen matching.
+# #6 — _marg_freeze propagation + frozen _match_marginal
 def test_marg_freeze():
     print("[#6] _marg_freeze propagation")
     from direct_coherence_loss import DirectTopologicalCoherenceLoss
@@ -59,14 +80,14 @@ def test_marg_freeze():
     w._marg_freeze = False
     check("unfreeze propagates", inner._marg_freeze is False and w._marg_freeze is False)
 
-    # Exercise the evaluator's save-and-restore path through the wrapper.
+    # the exact coherence_eval save/restore pattern, through the wrapper only
     prev = getattr(w, "_marg_freeze", False)
     w._marg_freeze = True
     check("val-instrument pattern freezes inner", inner._marg_freeze is True)
     w._marg_freeze = prev
     check("val-instrument pattern restores inner", inner._marg_freeze is False)
 
-    # Only unfrozen marginal matching updates the EMA.
+    # frozen _match_marginal must not write the EMA; unfrozen must
     obj = object.__new__(DifferentiableTopologicalCoherenceLoss)
     obj._marg_ema = {}
     cur = torch.rand(3, 5)
@@ -86,9 +107,10 @@ def test_marg_freeze():
           torch.allclose(heldout, torch.ones_like(heldout)))
 
 
-# Deployment-matched rollout.
+# #4 — deployment-matched rollout
 class _StubVelocityNet(nn.Module):
-    """Provide dropout and parameter-dependent stochasticity during training."""
+    """Velocity net with two train-mode stochasticity sources: layer dropout and
+    a params-dependent corruption drawn fresh per call."""
 
     def __init__(self, C=2):
         super().__init__()
@@ -174,7 +196,8 @@ def test_rollout():
     check("unsupported non-None params raise clearly", unsupported_raised)
     model.model = original
 
-    # Checkpointing preserves outputs and gradients across model modes.
+    # checkpointed vs non-checkpointed: same output and same grads, with backward()
+    # running while the model is in train mode (the recompute-mode trap).
     grads = {}
     outs = {}
     for tag, ck in (("ckpt", True), ("nockpt", False)):
@@ -233,7 +256,7 @@ def test_rollout():
         bad_raised = "do not identify obs_coords" in str(exc)
     check("hard clamp rejects indices from another query set", bad_raised)
 
-    # The one-step clean estimate is deterministic for a fixed RNG state.
+    # clean_estimate (one-step) is deterministic too, modulo its own global-RNG t-draw
     model.train(True)
     torch.manual_seed(3)
     e1 = clean_estimate(model, x1, coords, oc, ov, om, of, source_seed=5, params=params)
@@ -243,7 +266,7 @@ def test_rollout():
     check("clean_estimate restores train mode", model.training is True)
 
 
-# Physical-unit observed anchor.
+# #2 — physical-units observed anchor
 def test_physical_anchor():
     print("[#2] physical vorticity anchor")
     from direct_coherence_loss import (
@@ -251,7 +274,8 @@ def test_physical_anchor():
     from helpers import ActiveEmulsionDataset
     from topo_coherence_training.mph_fibered import build_observed_anchor
 
-    # Use nonlinear velocity normalization and linear phi/vorticity scaling.
+    # AE normalization shell: phi,w linear; vx,vy asinh with scale far below the
+    # velocity magnitude so the compression is strongly nonlinear.
     ds = object.__new__(ActiveEmulsionDataset)
     ds.lin_mask = torch.tensor([True, True, False, False])
     ds.asinh_scale = torch.tensor([1.0, 1.0, 0.5, 0.5])
@@ -453,7 +477,7 @@ def test_physical_anchor():
           "denormalize_points=(_ds_denorm if callable(_ds_denorm) else None)" in trainer_src)
 
 
-# Same-epoch topology weighting.
+# #5 — lambda applied same-epoch
 def test_lambda():
     print("[#5] lambda probe application")
     import types
@@ -467,7 +491,8 @@ def test_lambda():
     after = current_coherence_loss_weight(args, epoch=1)
     check("warmup schedule scales the configured fixed weight",
           abs(after - 3.788e-5 * 0.1) < 1e-12 and before == 0.05)
-    # Constrained primal-dual training replaces adaptive lambda controllers.
+    # The lambda probe/adapt controllers are retired; the constrained
+    # primal-dual mode replaces them (see test_constrained_topo.py).
     src = (SRC / "train_pointcloud_ffm.py").read_text()
     check("lambda probe/adapt controllers are fully removed from the trainer",
           "lambda_probe" not in src and "lambda_adapt" not in src
@@ -561,7 +586,7 @@ def test_lambda():
         trainer.clean_estimate_rollout = original_rollout
 
 
-# Resume and checkpoint state.
+# #7 — resume/checkpoint state
 def test_resume_state():
     print("[#7] resume + checkpoint state")
     from train_pointcloud_ffm import (collect_rng_state, restore_rng_state,
@@ -589,9 +614,9 @@ def test_resume_state():
 
     ok_ckpt = {"field_names": list(_DS.field_names), "mean": _DS.mean.clone(),
                "std": _DS.std.clone()}
-    validate_pretrained_stats(ok_ckpt, _DS)          # Matching metadata is accepted.
+    validate_pretrained_stats(ok_ckpt, _DS)          # must not raise
     check("stats guard passes on matching provenance", True)
-    validate_pretrained_stats({"epoch": 3}, _DS)     # Missing legacy metadata is skipped.
+    validate_pretrained_stats({"epoch": 3}, _DS)     # old ckpt w/o keys: skip
     check("stats guard skips absent keys (old ckpts)", True)
     bad = dict(ok_ckpt, mean=_DS.mean + 0.5)
     try:
@@ -599,7 +624,7 @@ def test_resume_state():
         check("stats guard raises on mean drift", False)
     except RuntimeError:
         check("stats guard raises on mean drift", True)
-    validate_pretrained_stats(bad, _DS, allow_mismatch=True)   # Explicit mismatch override.
+    validate_pretrained_stats(bad, _DS, allow_mismatch=True)   # escape hatch
     check("allow_mismatch escape hatch works", True)
     swapped = dict(ok_ckpt, field_names=["phi", "w", "vy", "vx"])
     try:
@@ -680,7 +705,7 @@ def test_resume_state():
         selected = find_latest_run_dir(td, "runs/arm", 13, require_checkpoint=True)
         check("resume skips a newer checkpoint-less launch directory", selected == old)
 
-    # Preserve the staged marginal EMA across reference loading.
+    # staged marginal EMA survives the reference loader's reset
     from topo_coherence_training.topo_loss import DifferentiableTopologicalCoherenceLoss
     key = ("self", 0, 1, 1)
     ref = {"levels": {key: np.arange(5, dtype=np.float32)},
@@ -715,7 +740,7 @@ def test_resume_state():
     check("immutable snapshots wired", 'f"ckpt_ep{epoch:05d}.pt"' in src)
 
 
-# Parameter forwarding in the deployed gate.
+# #8 — deployed gate params forwarding
 def test_gate_params():
     print("[#8] gate params forwarding")
     import inspect
@@ -746,7 +771,7 @@ def test_gate_params():
         check("_snapshot_params raises on missing params", True)
 
 
-# Configuration inheritance and N12 YAML validation.
+# #9 — config inheritance + N12 YAML smoke
 def test_config_surface():
     print("[#9] config inheritance + YAML smoke")
     import yaml
@@ -803,14 +828,18 @@ def test_config_surface():
     check("resume twin flips only RELOAD",
           res["RELOAD"] is True
           and {k for k in set(arm) | set(res) if arm.get(k) != res.get(k)} == {"RELOAD"})
-    # Post-training uses the immutable frozen base checkpoint.
+    # Post-training must start from an immutable copy of the base's final
+    # plateau state (frozen_ep3615_posttrain_base); last.pt is mutable if
+    # base training ever resumes and is therefore not a valid source.
     check("arm requires the immutable plateau-snapshot source",
           arm["pretrained_checkpoint"] == "frozen_ep3615_posttrain_base"
           and arm["pretrained_min_epoch"] == 3000
           and arm["pretrained_strict"] is True)
     check("N12 uses co-located velocity sensors",
           arm["sensor_layout"] == ctl["sensor_layout"] == "colocated")
-    # Training uses NFE=8, while held-out evaluation uses NFE=32.
+    # Training rollouts use NFE=8 for throughput; RF reconstruction is
+    # few-NFE-converged, and held-out gates still evaluate at NFE=32, which
+    # bounds the residual train/deploy distribution gap.
     check("N12 topology rollout path (NFE=8 by throughput requirement)",
           arm["epi_rollout_steps"] == 8
           and arm["topo_prediction_path"] == "rollout"
@@ -835,16 +864,21 @@ def test_config_surface():
     check("N13 uses conservative cadence and optimizer scales",
           arm["lr"] == 3.0e-5
           and arm["coherence_every_n_steps"] == 8)
-    # The constrained objective uses a DRaFT-1 rollout gradient and validation fuse.
+    # The topology term enters as a constrained primal-dual
+    # objective (min L_topo s.t. data & anchor budgets) with a DRaFT-1
+    # truncated rollout gradient; the lambda probe/adapt/ceiling/stall keys are
+    # gone from the configs. The val-RF fuse that could permanently zero the
+    # topology term mid-run has since been DELETED from the trainer -- these
+    # configs may still carry its inert keys, which the loader warns about and
+    # ignores. Feasibility now lives in the duals during training and in Pareto
+    # selection on the deliverable, so nothing silently ends the treatment.
     check("N13 uses the constrained primal-dual topology mode",
           arm["topo_objective_mode"] == "constrained"
           and ctl["topo_objective_mode"] == "constrained"
           and arm["anchor_budget_frac"] == 0.05
           and arm["dual_lr"] == 0.01
           and arm["dual_loss_ema_decay"] == 0.95
-          and arm["topo_rollout_backprop_k"] == 1
-          and arm["val_rf_guard"] is True
-          and arm["val_rf_guard_patience"] == 1)
+          and arm["topo_rollout_backprop_k"] == 1)
     check("legacy lambda-controller keys are absent from the N13 configs",
           all(key not in cfg for cfg in (arm, ctl)
               for key in ("lambda_probe", "lambda_probe_target_ratio",
@@ -894,7 +928,7 @@ def test_config_surface():
           and built.marginal_level_mode == "physical")
 
 
-# Stratifier keys and validation.
+# (m) — stratifier keys + fail-loud checks
 def test_stratifier():
     print("[m] stratifier keys")
     from helpers import ActiveEmulsionDataset
